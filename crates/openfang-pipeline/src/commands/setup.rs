@@ -198,8 +198,10 @@ Output only the markdown content, starting with: # Frontend Standards\n",
 
 fn run_claude_setup(prompt: &str, cwd: &Path) -> Result<String> {
     let out = Command::new("claude")
-        .args(["-p", "--max-budget-usd", "0.50", prompt])
+        .args(["-p", "--dangerously-skip-permissions", "--max-budget-usd", "0.50", prompt])
         .current_dir(cwd)
+        // Use stored Max subscription token, not API key billing
+        .env_remove("ANTHROPIC_API_KEY")
         .output()
         .context("Failed to run claude")?;
 

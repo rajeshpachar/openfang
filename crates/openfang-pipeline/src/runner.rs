@@ -157,6 +157,8 @@ impl ClaudeRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .current_dir(worktree)
+            // Remove API key so Claude uses the stored Max subscription token, not API billing.
+            .env_remove("ANTHROPIC_API_KEY")
             .spawn()
             .context("Failed to spawn claude — is claude CLI installed and on PATH?")?;
 

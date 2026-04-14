@@ -113,10 +113,22 @@ pub fn print_and_check(result: &DoctorResult) -> bool {
 // ---------------------------------------------------------------------------
 
 fn check_claude() -> (bool, String, Option<String>) {
-    // Auth probe: very cheap call, $0.001 budget cap
+    // Step 1: binary present?
+    let version = Command::new("claude").args(["--version"]).output();
+    if let Err(e) = version {
+        return (false, String::new(), Some(format!("claude binary not found: {e}")));
+    }
+
+    // Step 2: auth probe — any well-formed JSON response proves Claude is running and authenticated.
+    // Max plan subscribers get is_error=true with "Credit balance" (billing, not auth).
+    // API key users with active credits get a normal success response.
+    // Both are authenticated; only missing token/API key returns a non-JSON error.
     let out = Command::new("claude")
         .args([
             "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "json",
             "--max-budget-usd",
             "0.001",
             "Reply with the single word: ready",
@@ -126,28 +138,37 @@ fn check_claude() -> (bool, String, Option<String>) {
 
     match out {
         Err(e) => {
-            (false, String::new(), Some(format!("claude binary not found or not executable: {e}")))
+            (false, String::new(), Some(format!("claude invocation failed: {e}")))
         }
         Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+            let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-            let combined = format!("{} {}", stdout, stderr);
 
-            if is_auth_error(&combined) {
+            // If stdout parses as JSON with a session_id field, Claude is authenticated.
+            // This covers: successful run, Max plan (credit balance error), model errors.
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                if v.get("session_id").is_some() {
+                    let mode = detect_auth_mode();
+                    // If it was a Max plan billing response, note it
+                    let mode = if v["result"].as_str().unwrap_or("").to_lowercase().contains("credit balance") {
+                        "Max plan (subscription)".to_string()
+                    } else {
+                        mode
+                    };
+                    return (true, mode, None);
+                }
+            }
+
+            // Hard auth errors: no JSON at all + stderr mentions login/token
+            if is_auth_error(&stderr) {
                 return (
                     false,
                     String::new(),
-                    Some("Authentication failed -- no valid token or API key".to_string()),
+                    Some("Authentication failed — run `claude` to log in".to_string()),
                 );
             }
 
-            if output.status.success() || stdout.contains("ready") {
-                // Detect which auth mode is active
-                let mode = detect_auth_mode();
-                return (true, mode, None);
-            }
-
-            // Non-auth error (network, model, etc.) — treat as auth unknown
+            // Unexpected non-JSON failure
             (
                 false,
                 String::new(),
@@ -157,15 +178,14 @@ fn check_claude() -> (bool, String, Option<String>) {
     }
 }
 
-fn is_auth_error(output: &str) -> bool {
-    output.contains("authentication")
-        || output.contains("not authenticated")
-        || output.contains("api key")
-        || output.contains("unauthorized")
-        || output.contains("credit balance")
-        || output.contains("x-api-key")
-        || output.contains("login")
-        || output.contains("sign in")
+fn is_auth_error(stderr: &str) -> bool {
+    stderr.contains("authentication")
+        || stderr.contains("not authenticated")
+        || stderr.contains("unauthorized")
+        || stderr.contains("x-api-key")
+        || stderr.contains("login")
+        || stderr.contains("sign in")
+        || stderr.contains("no token")
 }
 
 fn detect_auth_mode() -> String {
