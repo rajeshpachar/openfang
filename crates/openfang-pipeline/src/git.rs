@@ -41,6 +41,11 @@ pub fn current_branch(repo_root: &Path) -> Result<String> {
     git(&["rev-parse", "--abbrev-ref", "HEAD"], repo_root)
 }
 
+/// Return the short commit hash at HEAD in the given directory.
+pub fn head_commit(dir: &Path) -> Result<String> {
+    git(&["rev-parse", "--short", "HEAD"], dir)
+}
+
 /// Return true if a local branch exists.
 pub fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool> {
     let out = Command::new("git")

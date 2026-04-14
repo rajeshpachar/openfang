@@ -35,6 +35,20 @@ pub struct StoryState {
     pub files_changed: Vec<String>,
     pub cost_usd: f64,
     pub cycle_count: u32,
+    /// Guard violations from the most recent Guard phase run.
+    #[serde(default)]
+    pub guard_errors: u32,
+    #[serde(default)]
+    pub guard_warns: u32,
+    /// Whether tests passed in the most recent Execute/GapFix run.
+    #[serde(default)]
+    pub test_passed: bool,
+    /// Human rejection notes stored from Gate2 for use in GapFix.
+    #[serde(default)]
+    pub rejection_notes: Option<String>,
+    /// Reason this story was blocked (if status == Blocked).
+    #[serde(default)]
+    pub block_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +89,9 @@ pub struct PipelineState {
     pub pr_url: Option<String>,
     /// OpenFang approval gate ID currently pending (if any).
     pub pending_gate_id: Option<String>,
+    /// Human feedback from Gate1 rejection — passed to next Decompose call.
+    #[serde(default)]
+    pub pending_feedback: Option<String>,
     /// Timestamp of last state update.
     pub last_updated: DateTime<Utc>,
     /// Timestamp when the pipeline first picked up this issue.
@@ -103,6 +120,7 @@ impl PipelineState {
             total_cost_usd: 0.0,
             pr_url: None,
             pending_gate_id: None,
+            pending_feedback: None,
             last_updated: now,
             started_at: now,
         }
@@ -167,8 +185,7 @@ impl PipelineState {
     pub fn block_story(&mut self, reason: &str) {
         if let Some(s) = self.stories.get_mut(self.current_story_idx) {
             s.status = StoryStatus::Blocked;
-            // Store reason in session_id slot as a quick workaround (Phase 2 only)
-            self.session_id = Some(format!("BLOCKED: {}", reason));
+            s.block_reason = Some(reason.to_string());
         }
     }
 

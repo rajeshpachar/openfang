@@ -141,7 +141,7 @@ pub async fn run(repo_root: &Path, issue_key: &str, cfg: &PipelineConfig) -> Res
             }
 
             Phase::Pr => {
-                pr_phase(&mut state, repo_root, &worktree_path, &issue_ctx, cfg, &claude, &backlog).await?;
+                pr_phase(&mut state, repo_root, &worktree_path, &issue_ctx, &role_file, cfg, &claude, &backlog).await?;
             }
 
             Phase::Complete => {
@@ -183,7 +183,16 @@ fn decompose(
 ) -> Result<()> {
     println!("\n{}", "Decompose".bold());
 
-    let assembled = prompt::assemble(repo_root, issue_ctx, role_file, PromptPhase::Decompose, None, cfg.repo_map_lines)?;
+    let mut assembled = prompt::assemble(repo_root, issue_ctx, role_file, PromptPhase::Decompose, None, cfg.repo_map_lines)?;
+
+    // Append Gate1 rejection feedback to the prompt if present
+    if let Some(fb) = state.pending_feedback.take() {
+        assembled.text.push_str(&format!(
+            "\n\n---\n\nPREVIOUS PLAN REJECTED BY REVIEWER:\n{}\n\nRevise the plan accordingly.",
+            fb
+        ));
+    }
+
     println!("  Prompt: ~{} tokens", assembled.estimated_tokens);
 
     println!("  Calling Claude to decompose issue...");
@@ -215,6 +224,11 @@ fn decompose(
             files_changed: vec![],
             cost_usd: 0.0,
             cycle_count: 0,
+            guard_errors: 0,
+            guard_warns: 0,
+            test_passed: false,
+            rejection_notes: None,
+            block_reason: None,
         })
         .collect();
 
@@ -266,9 +280,8 @@ fn gate1(state: &mut PipelineState, repo_root: &Path, issue_key: &str) -> Result
             if feedback.trim().is_empty() {
                 bail!("Feedback required when rejecting the plan");
             }
-            // Re-decompose — handled by staying in Decompose phase
-            // (the feedback isn't stored yet in Phase 1 state — just restart)
             println!("  {} Re-decomposing with feedback...", "↻".yellow());
+            state.pending_feedback = Some(feedback.trim().to_string());
             state.phase = Phase::Decompose;
             state.stories.clear();
             state.session_id = None;
@@ -329,7 +342,7 @@ fn execute(
     println!("  Calling Claude ({})", phase_display.dimmed());
 
     let result = if session_id.is_empty() {
-        claude.run_execute(worktree, &assembled.text, "new")
+        claude.run_execute_fresh(worktree, &assembled.text)
     } else {
         claude.run_execute(worktree, &assembled.text, &session_id)
     }?;
@@ -357,6 +370,7 @@ fn execute(
     let status = runner::get_str(so, "status").unwrap_or("unknown");
     let files_changed = runner::get_str_array(so, "files_changed");
     let test_passed = runner::get_bool(so, "test_passed").unwrap_or(false);
+    let tests_run = runner::get_str_array(so, "tests_run");
     let progress_update = runner::get_str(so, "progress_update").unwrap_or("").to_string();
     let handoff_note = runner::get_str(so, "handoff_note").unwrap_or("").to_string();
 
@@ -365,15 +379,21 @@ fn execute(
         let _ = prompt::update_progress(repo_root, &issue_ctx.key, &story.id, &progress_update);
     }
 
-    // Store files changed in story state
+    // Capture commit hash from worktree HEAD
+    let commit_hash = crate::git::head_commit(worktree).unwrap_or_else(|_| "unknown".to_string());
+
+    // Store results in story state
     if let Some(s) = state.stories.get_mut(state.current_story_idx) {
         s.files_changed = files_changed.clone();
+        s.test_passed = test_passed;
+        s.commit_hash = Some(commit_hash);
     }
 
-    println!("  {} Status: {} | Tests: {} | Files: {}",
+    println!("  {} Status: {} | Tests: {} ({} run) | Files: {}",
         if status == "done" { "✓".green() } else { "⚠".yellow() },
         status.bold(),
         if test_passed { "passed".green() } else { "FAILED".red() },
+        tests_run.len(),
         files_changed.len()
     );
 
@@ -425,11 +445,10 @@ fn run_guards(
         println!("  {} {} errors, {} warnings", "↑".dimmed(), error_count, warn_count);
     }
 
-    // Store guard results in state
+    // Store guard results in story state for gate2 display
     if let Some(story) = state.stories.get_mut(state.current_story_idx) {
-        // Store violation count in cycle_count slot as a signal (v2: proper field)
-        let _ = (error_count, warn_count);
-        let _ = story;
+        story.guard_errors = error_count as u32;
+        story.guard_warns = warn_count as u32;
     }
 
     state.phase = Phase::Gate2;
@@ -446,31 +465,47 @@ async fn gate2(
         .ok_or_else(|| anyhow::anyhow!("No current story for gate"))?
         .clone();
 
-    let files_changed_count = story.files_changed.len();
-    let guard_pass = true; // simplified — v2 reads from stored guard results
+    // Enforce cycle limit before going to the gate
+    if story.cycle_count >= cfg.max_cycles_per_story {
+        println!(
+            "\n  {} {} reached cycle limit ({}/{}) — blocking for human intervention",
+            "LIMIT".red().bold(), story.id, story.cycle_count, cfg.max_cycles_per_story
+        );
+        state.block_story(&format!(
+            "Cycle limit {}/{} reached without approval",
+            story.cycle_count, cfg.max_cycles_per_story
+        ));
+        state.phase = Phase::Gate2; // Stay at gate so human can abandon or override
+        // Fall through to terminal fallback below
+    }
 
-    // Build gate summary
+    let guard_pass = story.guard_errors == 0;
     let summary = GateSummary {
         issue_key: &state.issue_key,
         story_id: &story.id,
         story_title: &story.title,
         guard_pass,
-        error_count: 0,
-        warn_count: 0,
-        test_passed: true,
+        error_count: story.guard_errors as usize,
+        warn_count: story.guard_warns as usize,
+        test_passed: story.test_passed,
         commit_hash: story.commit_hash.as_deref().unwrap_or("unknown"),
-        files_changed: files_changed_count,
+        files_changed: story.files_changed.len(),
         cost_this_issue: state.total_cost_usd,
         branch: &state.branch,
         cycle: story.cycle_count,
         max_cycles: cfg.max_cycles_per_story,
     };
 
-    let gate = GateClient::with_agent_id(&cfg.openfang_url, "pipeline");
-    // Note: in production, use GateClient::new(&cfg.openfang_url).await? to fetch real agent_id.
-    // Using a placeholder here allows the pipeline to work without OpenFang running.
+    // Try OpenFang gate; fall back to terminal on connection error
+    let gate_result = match GateClient::new(&cfg.openfang_url).await {
+        Ok(gate) => gate.post_and_wait(&summary).await,
+        Err(e) => {
+            eprintln!("  {} OpenFang unavailable ({}): using terminal gate", "WARN".yellow(), e);
+            return terminal_gate_fallback(state, cfg).await;
+        }
+    };
 
-    match gate.post_and_wait(&summary).await {
+    match gate_result {
         Ok(GateDecision::Approved) => {
             println!("  {} Approved — continuing", "✓".green().bold());
             let more_stories = state.advance_story();
@@ -487,20 +522,20 @@ async fn gate2(
             }
         }
         Ok(GateDecision::Rejected { notes }) => {
-            let feedback = notes.unwrap_or_default();
+            let feedback = notes.clone().unwrap_or_default();
             println!("  {} Rejected — entering rework", "✗".red().bold());
             if !feedback.is_empty() {
                 println!("  Feedback: {}", feedback.dimmed());
             }
-            // Store feedback in state for GapFix prompt
+            // Store rejection notes for GapFix prompt
             if let Some(s) = state.stories.get_mut(state.current_story_idx) {
                 s.status = StoryStatus::Flagged;
+                s.rejection_notes = notes;
             }
             state.phase = Phase::GapFix;
         }
         Err(e) => {
-            // Gate client error (OpenFang not running etc.) — fall back to terminal gate
-            eprintln!("  {} Gate client error: {} — using terminal fallback", "WARN".yellow(), e);
+            eprintln!("  {} Gate poll error: {} — using terminal fallback", "WARN".yellow(), e);
             terminal_gate_fallback(state, cfg).await?;
         }
     }
@@ -555,12 +590,16 @@ fn gapfix(
         bail!("No session_id for GapFix — cannot resume. Check state file.");
     }
 
+    let feedback_text = story.rejection_notes.clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Address any test failures and code quality issues.".to_string());
+
     let story_ctx = StoryContext {
         id: story.id.clone(),
         title: story.title.clone(),
         completed_stories: state.completed_story_ids(),
         session_note: String::new(),
-        feedback: Some("Please address the reviewer's feedback and re-run the story tests.".to_string()),
+        feedback: Some(feedback_text),
     };
 
     let assembled = prompt::assemble(
@@ -597,11 +636,13 @@ fn gapfix(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pr_phase(
     state: &mut PipelineState,
     repo_root: &Path,
     worktree: &Path,
     issue_ctx: &IssueContext,
+    role_file: &Path,
     _cfg: &PipelineConfig,
     claude: &ClaudeRunner,
     backlog: &BacklogClient,
@@ -616,7 +657,6 @@ async fn pr_phase(
         .map(|s| s.id.clone())
         .collect();
 
-    let role_file = std::path::PathBuf::from(".pipeline/backend.md"); // simplified
     let story_ctx = StoryContext {
         id: "PR".into(),
         title: issue_ctx.summary.clone(),
@@ -625,14 +665,10 @@ async fn pr_phase(
         feedback: None,
     };
 
-    // Find the role file properly
-    let backend_file = repo_root.join(".pipeline").join("backend.md");
-    let role_file_path = if backend_file.exists() { backend_file } else { role_file };
-
     let assembled = prompt::assemble(
         repo_root,
         issue_ctx,
-        &role_file_path,
+        role_file,
         PromptPhase::Pr,
         Some(&story_ctx),
         0,
@@ -640,8 +676,8 @@ async fn pr_phase(
 
     println!("  Calling Claude to open draft PR...");
     let result = if session_id.is_empty() {
-        // Shouldn't happen, but handle gracefully
-        claude.run_pr(worktree, &assembled.text, "new")
+        // No session to resume — start fresh (unusual but safe)
+        claude.run_execute_fresh(worktree, &assembled.text)
     } else {
         claude.run_pr(worktree, &assembled.text, &session_id)
     }?;

@@ -109,6 +109,11 @@ impl ClaudeRunner {
         self.call(worktree, prompt, Some(session_id), self.max_budget_usd, EXECUTE_SCHEMA)
     }
 
+    /// Execute phase — new session (used after Ralph loop clears session_id).
+    pub fn run_execute_fresh(&self, worktree: &Path, prompt: &str) -> Result<ClaudeResult> {
+        self.call(worktree, prompt, None, self.max_budget_usd, EXECUTE_SCHEMA)
+    }
+
     /// GapFix phase — resume session with reviewer feedback appended.
     pub fn run_gapfix(&self, worktree: &Path, prompt: &str, session_id: &str) -> Result<ClaudeResult> {
         self.call(worktree, prompt, Some(session_id), self.max_budget_usd, EXECUTE_SCHEMA)
