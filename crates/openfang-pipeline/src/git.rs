@@ -256,6 +256,12 @@ pub fn setup_issue_workspace(
 
     ensure_agent_dev(repo_root, base_branch)?;
     let branch = create_issue_branch(repo_root, issue_key)?;
+
+    // Switch the main worktree back to base_branch so the issue branch can be
+    // added as a separate worktree. Git refuses to add a worktree for a branch
+    // that is already checked out in the main worktree.
+    git(&["checkout", base_branch], repo_root)?;
+
     let worktree_path = ensure_worktree(repo_root, issue_key, &branch)?;
 
     Ok((branch, worktree_path))
