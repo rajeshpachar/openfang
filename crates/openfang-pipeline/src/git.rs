@@ -261,6 +261,61 @@ pub fn setup_issue_workspace(
     Ok((branch, worktree_path))
 }
 
+// ---------------------------------------------------------------------------
+// US-014: Story revert — git reset + checkout + clean
+// ---------------------------------------------------------------------------
+
+/// Classify files changed in the last commit as added (new) vs modified/deleted.
+/// Returns `(modified_or_deleted, added)`.
+/// Uses `git diff --name-status HEAD~1 HEAD`.
+pub fn classify_last_commit_files(worktree: &Path) -> Result<(Vec<String>, Vec<String>)> {
+    let out = git(&["diff", "--name-status", "HEAD~1", "HEAD"], worktree)?;
+    let mut modified = Vec::new();
+    let mut added = Vec::new();
+
+    for line in out.lines() {
+        if let Some((status, file)) = line.split_once('\t') {
+            if status.starts_with('A') {
+                added.push(file.to_string());
+            } else {
+                // M = modified, D = deleted, R = renamed, C = copied
+                modified.push(file.to_string());
+            }
+        }
+    }
+
+    Ok((modified, added))
+}
+
+/// Revert the last commit and restore the working tree to its pre-story state.
+///
+/// Steps (scoped to story files only — never touches the full working tree):
+///   1. `git reset HEAD~1 --mixed`    — moves HEAD back, unstages changes
+///   2. `git checkout -- {modified}`  — restores tracked files to HEAD (now parent)
+///   3. `git clean -fd -- {added}`    — removes newly created (untracked) files
+pub fn revert_story_commit(worktree: &Path) -> Result<()> {
+    let (modified, added) = classify_last_commit_files(worktree)?;
+
+    // Step 1: move HEAD back (working tree unchanged after this)
+    git(&["reset", "HEAD~1", "--mixed"], worktree)?;
+
+    // Step 2: restore modified/deleted tracked files to the parent commit
+    if !modified.is_empty() {
+        let mut args: Vec<&str> = vec!["checkout", "--"];
+        let refs: Vec<&str> = modified.iter().map(|s| s.as_str()).collect();
+        args.extend(refs.iter().copied());
+        git(&args, worktree)?;
+    }
+
+    // Step 3: remove added files (now untracked after reset) — scoped per-file
+    for file in &added {
+        // Ignore errors: file might have already been cleaned up
+        let _ = git(&["clean", "-fd", "--", file], worktree);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

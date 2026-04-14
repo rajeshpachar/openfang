@@ -83,6 +83,9 @@ pub enum ClaudeResult {
     Success(ClaudeOutput),
     /// Claude hit the budget cap before committing — no changes were made.
     BudgetExhausted,
+    /// The session ID passed via `--resume` is no longer valid (expired or not found).
+    /// Caller should start a fresh session and prepend handoff notes.
+    SessionExpired,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +177,10 @@ impl ClaudeRunner {
                 if raw.subtype.as_deref() == Some("error_max_budget_usd") {
                     return Ok(ClaudeResult::BudgetExhausted);
                 }
+            }
+            // Expired session detection (POC-1): stderr contains "No conversation found with session ID"
+            if crate::session::is_expired_session_error(stderr.as_ref()) {
+                return Ok(ClaudeResult::SessionExpired);
             }
             bail!(
                 "claude exited {}\nstderr: {}\nstdout (first 500 chars): {}",

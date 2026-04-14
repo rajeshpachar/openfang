@@ -13,10 +13,12 @@ use std::path::Path;
 use crate::backlog::{BacklogClient, STATUS_IN_PROGRESS, STATUS_OPEN};
 use crate::classifier::{classify, ClassifyResult};
 use crate::config::PipelineConfig;
+use crate::feedback;
 use crate::gate::{GateClient, GateDecision, GateSummary};
 use crate::guards::GuardRunner;
 use crate::prompt::{self, IssueContext, PromptPhase, StoryContext};
 use crate::runner::{self, ClaudeResult, ClaudeRunner};
+use crate::session;
 use crate::state::{Phase, PipelineState, Role, StoryState, StoryStatus};
 
 // ---------------------------------------------------------------------------
@@ -103,6 +105,10 @@ pub async fn run(repo_root: &Path, issue_key: &str, cfg: &PipelineConfig) -> Res
         priority: issue.priority.name.clone(),
     };
 
+    // Validate session config before starting
+    let max_stories_per_session =
+        session::validate_max_stories_per_session(cfg.max_stories_per_session);
+
     let claude = ClaudeRunner::new(cfg.max_budget_usd);
     let guards = GuardRunner::load(&cfg.guards_file(repo_root)).unwrap_or_else(|e| {
         eprintln!("  {} Failed to load guards.toml: {} — skipping guards", "WARN".yellow(), e);
@@ -133,7 +139,7 @@ pub async fn run(repo_root: &Path, issue_key: &str, cfg: &PipelineConfig) -> Res
             }
 
             Phase::Gate2 => {
-                gate2(&mut state, repo_root, cfg, &backlog).await?;
+                gate2(&mut state, repo_root, cfg, &backlog, max_stories_per_session).await?;
             }
 
             Phase::GapFix => {
@@ -200,6 +206,7 @@ fn decompose(
 
     let output = match result {
         ClaudeResult::BudgetExhausted => bail!("Budget exhausted during decompose — increase max_budget_usd"),
+        ClaudeResult::SessionExpired => bail!("Unexpected session expiry during decompose phase"),
         ClaudeResult::Success(o) => o,
     };
 
@@ -229,6 +236,8 @@ fn decompose(
             test_passed: false,
             rejection_notes: None,
             block_reason: None,
+            flag_count: 0,
+            rejection_count: 0,
         })
         .collect();
 
@@ -324,7 +333,7 @@ fn execute(
         feedback: None,
     };
 
-    let assembled = prompt::assemble(
+    let mut assembled = prompt::assemble(
         repo_root,
         issue_ctx,
         role_file,
@@ -332,6 +341,20 @@ fn execute(
         Some(&story_ctx),
         cfg.repo_map_lines,
     )?;
+
+    // On fresh session: prepend handoff notes from all completed stories so Claude re-orients
+    if session_id.is_empty() {
+        let completed_ids = state.completed_story_ids();
+        if !completed_ids.is_empty() {
+            let notes = session::load_handoff_notes(repo_root, &issue_ctx.key, &completed_ids);
+            let preamble = session::build_handoff_preamble(&notes);
+            if !preamble.is_empty() {
+                println!("  {} Injecting {} handoff notes for fresh session", "↻".cyan(), notes.len());
+                assembled.text = format!("{}\n\n---\n\n{}", preamble, assembled.text);
+            }
+        }
+    }
+
     println!("  Prompt: ~{} tokens", assembled.estimated_tokens);
 
     let phase_display = if session_id.is_empty() {
@@ -340,6 +363,16 @@ fn execute(
         format!("--resume {}", &session_id[..session_id.len().min(8)])
     };
     println!("  Calling Claude ({})", phase_display.dimmed());
+
+    // Check token threshold — proactively start fresh session if prompt is too large
+    if assembled.estimated_tokens > session::TOKEN_FRESH_SESSION_THRESHOLD && !session_id.is_empty() {
+        println!(
+            "  {} Prompt too large (~{} tokens > {}k) — starting fresh session with handoff notes",
+            "↻".cyan(), assembled.estimated_tokens, session::TOKEN_FRESH_SESSION_THRESHOLD / 1000
+        );
+        state.session_id = None;
+        return Ok(()); // Re-enter Execute with cleared session_id
+    }
 
     let result = if session_id.is_empty() {
         claude.run_execute_fresh(worktree, &assembled.text)
@@ -352,8 +385,16 @@ fn execute(
             println!("\n  {} BUDGET EXCEEDED — {} incomplete", "✗".red().bold(), story.id);
             println!("  No changes were committed.");
             println!("  Increase max_budget_usd in .pipeline/config.toml and retry.");
-            // Stay in Execute phase with incremented cycle
             state.increment_cycle();
+            return Ok(());
+        }
+        ClaudeResult::SessionExpired => {
+            println!(
+                "\n  {} Session expired for {} — starting fresh session with handoff notes",
+                "↻".yellow(), story.id
+            );
+            state.session_id = None;
+            // Re-enter Execute; on next iteration the assembled prompt will include handoff preamble
             return Ok(());
         }
         ClaudeResult::Success(o) => o,
@@ -374,9 +415,15 @@ fn execute(
     let progress_update = runner::get_str(so, "progress_update").unwrap_or("").to_string();
     let handoff_note = runner::get_str(so, "handoff_note").unwrap_or("").to_string();
 
-    // Accumulate progress notes
+    // Accumulate progress notes and truncate if needed
     if !progress_update.is_empty() {
         let _ = prompt::update_progress(repo_root, &issue_ctx.key, &story.id, &progress_update);
+        let _ = session::truncate_progress_if_needed(repo_root);
+    }
+
+    // Save handoff_note for session continuity (US-016)
+    if !handoff_note.is_empty() {
+        let _ = session::save_handoff_note(repo_root, &issue_ctx.key, &story.id, &handoff_note);
     }
 
     // Capture commit hash from worktree HEAD
@@ -403,8 +450,6 @@ fn execute(
         state.block_story(&blocker);
         // Still proceed to guard+gate so human can see and decide
     }
-
-    let _ = handoff_note; // Will be used in v2 for fresh session priming
 
     state.phase = Phase::Guard;
     Ok(())
@@ -457,9 +502,10 @@ fn run_guards(
 
 async fn gate2(
     state: &mut PipelineState,
-    _repo_root: &Path,
+    repo_root: &Path,
     cfg: &PipelineConfig,
-    _backlog: &BacklogClient,
+    backlog: &BacklogClient,
+    max_stories_per_session: u32,
 ) -> Result<()> {
     let story = state.current_story()
         .ok_or_else(|| anyhow::anyhow!("No current story for gate"))?
@@ -475,8 +521,13 @@ async fn gate2(
             "Cycle limit {}/{} reached without approval",
             story.cycle_count, cfg.max_cycles_per_story
         ));
-        state.phase = Phase::Gate2; // Stay at gate so human can abandon or override
-        // Fall through to terminal fallback below
+        let msg = format!(
+            "Story {} blocked: reached cycle limit {}/{}. Manually resolve then `pipeline resume {}`.",
+            story.id, story.cycle_count, cfg.max_cycles_per_story, state.issue_key
+        );
+        let _ = backlog.add_comment(&state.issue_key, &msg).await;
+        state.phase = Phase::Abandoned;
+        return Ok(());
     }
 
     let guard_pass = guard_passed(story.guard_errors);
@@ -496,75 +547,203 @@ async fn gate2(
         max_cycles: cfg.max_cycles_per_story,
     };
 
-    // Try OpenFang gate; fall back to terminal on connection error
-    let gate_result = match GateClient::new(&cfg.openfang_url).await {
-        Ok(gate) => gate.post_and_wait(&summary).await,
-        Err(e) => {
-            eprintln!("  {} OpenFang unavailable ({}): using terminal gate", "WARN".yellow(), e);
-            return terminal_gate_fallback(state, cfg).await;
+    // Cache agent_id on first gate to avoid re-fetching every story
+    let gate = if let Some(ref id) = state.cached_agent_id.clone() {
+        GateClient::with_agent_id(&cfg.openfang_url, id)
+    } else {
+        match GateClient::new(&cfg.openfang_url).await {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("  {} OpenFang unavailable ({}): using terminal gate", "WARN".yellow(), e);
+                return terminal_gate_fallback(state, repo_root, cfg, backlog, max_stories_per_session).await;
+            }
         }
     };
 
+    let gate_result = gate.post_and_wait(&summary).await;
+
     match gate_result {
         Ok(GateDecision::Approved) => {
-            println!("  {} Approved — continuing", "✓".green().bold());
-            let more_stories = state.advance_story();
-            if more_stories {
-                // Check Ralph loop threshold
-                if is_ralph_threshold(state.current_story_idx, cfg.max_stories_per_session) {
-                    println!("  {} Ralph loop — starting fresh session after {} stories",
-                        "↻".cyan(), cfg.max_stories_per_session);
-                    state.session_id = None;
-                }
-                state.phase = Phase::Execute;
-            } else {
-                state.phase = Phase::Pr;
-            }
+            on_story_approved(state, repo_root, cfg, backlog, max_stories_per_session).await?;
         }
         Ok(GateDecision::Rejected { notes }) => {
-            let feedback = notes.clone().unwrap_or_default();
-            println!("  {} Rejected — entering rework", "✗".red().bold());
-            if !feedback.is_empty() {
-                println!("  Feedback: {}", feedback.dimmed());
-            }
-            // Store rejection notes for GapFix prompt
-            if let Some(s) = state.stories.get_mut(state.current_story_idx) {
-                s.status = StoryStatus::Flagged;
-                s.rejection_notes = notes;
-            }
-            state.phase = Phase::GapFix;
+            let raw_notes = notes.unwrap_or_default();
+            on_story_feedback(state, repo_root, &story, &raw_notes, backlog).await?;
         }
         Err(e) => {
             eprintln!("  {} Gate poll error: {} — using terminal fallback", "WARN".yellow(), e);
-            terminal_gate_fallback(state, cfg).await?;
+            terminal_gate_fallback(state, repo_root, cfg, backlog, max_stories_per_session).await?;
         }
     }
 
     Ok(())
 }
 
-async fn terminal_gate_fallback(state: &mut PipelineState, _cfg: &PipelineConfig) -> Result<()> {
+async fn terminal_gate_fallback(
+    state: &mut PipelineState,
+    repo_root: &Path,
+    cfg: &PipelineConfig,
+    backlog: &BacklogClient,
+    max_stories_per_session: u32,
+) -> Result<()> {
     let story = state.current_story().ok_or_else(|| anyhow::anyhow!("No current story"))?.clone();
 
     println!("\n  {} OpenFang not available — terminal gate for {}", "FALLBACK".yellow(), story.id);
-    println!("  [A] Approve  [R] Reject  [Q] Quit");
+    println!("  [A] Approve   [R] Reject   [F] Flag   [P] Pause   [Q] Quit");
     print!("  Choice: ");
     io::Write::flush(&mut io::stdout()).ok();
 
     let stdin = io::stdin();
     let line = stdin.lock().lines().next().unwrap_or(Ok(String::new()))?;
     match line.trim().to_lowercase().as_str() {
-        "a" => {
-            let more = state.advance_story();
-            state.phase = if more { Phase::Execute } else { Phase::Pr };
+        "a" | "approve" => {
+            on_story_approved(state, repo_root, cfg, backlog, max_stories_per_session).await?;
         }
-        "r" => {
-            if let Some(s) = state.stories.get_mut(state.current_story_idx) {
-                s.status = StoryStatus::Flagged;
+        "r" | "reject" => {
+            println!("  Enter rejection notes (hard reject — commit will be reverted):");
+            print!("  > ");
+            io::Write::flush(&mut io::stdout()).ok();
+            let notes = stdin.lock().lines().next().unwrap_or(Ok(String::new()))?;
+            on_story_feedback(state, repo_root, &story, notes.trim(), backlog).await?;
+        }
+        "f" | "flag" => {
+            println!("  Enter flag feedback (soft feedback — Claude will amend):");
+            print!("  > ");
+            io::Write::flush(&mut io::stdout()).ok();
+            let fb = stdin.lock().lines().next().unwrap_or(Ok(String::new()))?;
+            let flag_notes = format!("FLAG: {}", fb.trim());
+            on_story_feedback(state, repo_root, &story, &flag_notes, backlog).await?;
+        }
+        "p" | "pause" => {
+            // US-015: Pause — add Backlog comment and exit cleanly
+            let msg = format!(
+                "Pipeline paused on story {} by human gate. Run `pipeline resume {}` to continue.",
+                story.id, state.issue_key
+            );
+            println!("  {} Pipeline paused. Run `pipeline resume {}` to continue.", "⏸".yellow(), state.issue_key);
+            let _ = backlog.add_comment(&state.issue_key, &msg).await;
+            std::process::exit(0);
+        }
+        _ => {
+            println!("  {} Quitting", "⏸".yellow());
+            std::process::exit(0);
+        }
+    }
+
+    Ok(())
+}
+
+/// US-013/016: Story approved — advance story index, apply Ralph loop if needed.
+async fn on_story_approved(
+    state: &mut PipelineState,
+    _repo_root: &Path,
+    _cfg: &PipelineConfig,
+    _backlog: &BacklogClient,
+    max_stories_per_session: u32,
+) -> Result<()> {
+    println!("  {} Story approved", "✓".green());
+
+    let more = state.advance_story();
+
+    if !more {
+        state.phase = Phase::Pr;
+        return Ok(());
+    }
+
+    // Ralph loop: clear session every N stories so Claude doesn't drift (US-016)
+    if is_ralph_threshold(state.current_story_idx, max_stories_per_session) {
+        println!(
+            "  {} Ralph loop: resetting session at story {} (every {} stories)",
+            "↻".cyan(),
+            state.current_story_idx,
+            max_stories_per_session
+        );
+        state.session_id = None;
+    }
+
+    state.phase = Phase::Execute;
+    Ok(())
+}
+
+/// US-013/014: Gate2 feedback — differentiate FLAG (soft) vs hard reject.
+///
+/// FLAG path (US-013): save feedback, increment flag_count, warn at ≥3,
+///   set rejection_notes, phase → GapFix (Claude amends the commit).
+///
+/// REJECT path (US-014): save rejection reason, increment rejection_count,
+///   if ≥3 → escalate (Backlog comment + Abandoned).
+///   Otherwise: revert commit, clear session_id, phase → Execute (redo from scratch).
+async fn on_story_feedback(
+    state: &mut PipelineState,
+    repo_root: &Path,
+    story: &StoryState,
+    notes: &str,
+    backlog: &BacklogClient,
+) -> Result<()> {
+    if feedback::is_flag(notes) {
+        // US-013: Soft flag — Claude amends without full revert
+        let flag_text = feedback::extract_flag_text(notes);
+        println!("  {} FLAG: {}", "⚑".yellow(), flag_text);
+
+        let _ = feedback::save_flag_feedback(repo_root, &state.issue_key, &story.id, &flag_text);
+
+        if let Some(s) = state.stories.get_mut(state.current_story_idx) {
+            s.flag_count += 1;
+            s.status = StoryStatus::Flagged;
+            s.rejection_notes = Some(flag_text.clone());
+        }
+
+        let flag_count = state.stories[state.current_story_idx].flag_count;
+        if flag_count >= 3 {
+            println!(
+                "  {} Story {} flagged {} times — consider a hard rejection",
+                "WARN".yellow(), story.id, flag_count
+            );
+        }
+
+        state.phase = Phase::GapFix;
+    } else {
+        // US-014: Hard reject — revert commit and redo from scratch
+        let notes_trimmed = notes.trim();
+        println!("  {} REJECT: {}", "✗".red().bold(), notes_trimmed);
+
+        let cycle = story.cycle_count;
+        let _ = feedback::save_rejection_reason(repo_root, &state.issue_key, &story.id, cycle, notes_trimmed);
+
+        if let Some(s) = state.stories.get_mut(state.current_story_idx) {
+            s.rejection_count += 1;
+            s.status = StoryStatus::InProgress;
+            s.rejection_notes = Some(notes_trimmed.to_string());
+        }
+
+        let rejection_count = state.stories[state.current_story_idx].rejection_count;
+
+        if rejection_count >= 3 {
+            // Escalate after 3 hard rejections
+            let msg = format!(
+                "Story {} rejected {} times without approval. Manual intervention required.\n\
+                Resolve the issues and run `pipeline resume {}` to continue.",
+                story.id, rejection_count, state.issue_key
+            );
+            println!("  {} {}", "ESCALATE".red().bold(), msg);
+            let _ = backlog.add_comment(&state.issue_key, &msg).await;
+            state.block_story(&format!("Hard-rejected {} times without approval", rejection_count));
+            state.phase = Phase::Abandoned;
+        } else {
+            // Revert the story's last commit so Claude starts clean
+            if let Err(e) = crate::git::revert_story_commit(&state.worktree_path) {
+                eprintln!(
+                    "  {} Failed to revert commit: {} — continuing without revert",
+                    "WARN".yellow(), e
+                );
+            } else {
+                println!("  {} Commit reverted — re-executing story from scratch", "↻".yellow());
             }
-            state.phase = Phase::GapFix;
+
+            // Clear session_id: force fresh session so Claude doesn't see the reverted work
+            state.session_id = None;
+            state.phase = Phase::Execute;
         }
-        _ => std::process::exit(0),
     }
 
     Ok(())
@@ -586,9 +765,6 @@ fn gapfix(
     println!("\n{} {}: {}", "GapFix".bold(), story.id.cyan(), story.title);
 
     let session_id = state.session_id.clone().unwrap_or_default();
-    if session_id.is_empty() {
-        bail!("No session_id for GapFix — cannot resume. Check state file.");
-    }
 
     let feedback_text = story.rejection_notes.clone()
         .filter(|s| !s.is_empty())
@@ -602,7 +778,7 @@ fn gapfix(
         feedback: Some(feedback_text),
     };
 
-    let assembled = prompt::assemble(
+    let mut assembled = prompt::assemble(
         repo_root,
         issue_ctx,
         role_file,
@@ -611,7 +787,24 @@ fn gapfix(
         cfg.repo_map_lines,
     )?;
 
-    let result = claude.run_gapfix(worktree, &assembled.text, &session_id)?;
+    // On fresh session (expired or post-reject): prepend handoff preamble so Claude re-orients
+    if session_id.is_empty() {
+        let completed_ids = state.completed_story_ids();
+        if !completed_ids.is_empty() {
+            let notes = session::load_handoff_notes(repo_root, &issue_ctx.key, &completed_ids);
+            let preamble = session::build_handoff_preamble(&notes);
+            if !preamble.is_empty() {
+                println!("  {} Injecting {} handoff notes for fresh-session gapfix", "↻".cyan(), notes.len());
+                assembled.text = format!("{}\n\n---\n\n{}", preamble, assembled.text);
+            }
+        }
+    }
+
+    let result = if session_id.is_empty() {
+        claude.run_execute_fresh(worktree, &assembled.text)
+    } else {
+        claude.run_gapfix(worktree, &assembled.text, &session_id)
+    }?;
 
     let output = match result {
         ClaudeResult::BudgetExhausted => {
@@ -619,9 +812,21 @@ fn gapfix(
             state.phase = Phase::Guard;
             return Ok(());
         }
+        ClaudeResult::SessionExpired => {
+            // Clear session_id; re-enter GapFix next iteration with fresh session
+            println!(
+                "  {} Session expired during gapfix — retrying with fresh session",
+                "↻".yellow()
+            );
+            state.session_id = None;
+            return Ok(());
+        }
         ClaudeResult::Success(o) => o,
     };
 
+    if !output.session_id.is_empty() {
+        state.session_id = Some(output.session_id.clone());
+    }
     state.add_cost(output.total_cost_usd);
     state.increment_cycle();
 
@@ -685,6 +890,12 @@ async fn pr_phase(
     let output = match result {
         ClaudeResult::BudgetExhausted => {
             println!("  {} Budget exhausted during PR phase", "✗".red());
+            return Ok(());
+        }
+        ClaudeResult::SessionExpired => {
+            // PR phase lost its session — retry with a fresh session next iteration
+            println!("  {} Session expired during PR phase — retrying fresh", "↻".yellow());
+            state.session_id = None;
             return Ok(());
         }
         ClaudeResult::Success(o) => o,
@@ -801,6 +1012,8 @@ mod tests {
                 test_passed: false,
                 rejection_notes: None,
                 block_reason: None,
+                flag_count: 0,
+                rejection_count: 0,
             })
             .collect();
         s.set_stories(stories);

@@ -49,6 +49,12 @@ pub struct StoryState {
     /// Reason this story was blocked (if status == Blocked).
     #[serde(default)]
     pub block_reason: Option<String>,
+    /// Number of soft flags (US-013) received for this story.
+    #[serde(default)]
+    pub flag_count: u32,
+    /// Number of hard rejections (US-014) received for this story.
+    #[serde(default)]
+    pub rejection_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,6 +98,9 @@ pub struct PipelineState {
     /// Human feedback from Gate1 rejection — passed to next Decompose call.
     #[serde(default)]
     pub pending_feedback: Option<String>,
+    /// OpenFang agent_id cached at first gate to avoid re-fetching.
+    #[serde(default)]
+    pub cached_agent_id: Option<String>,
     /// Timestamp of last state update.
     pub last_updated: DateTime<Utc>,
     /// Timestamp when the pipeline first picked up this issue.
@@ -121,6 +130,7 @@ impl PipelineState {
             pr_url: None,
             pending_gate_id: None,
             pending_feedback: None,
+            cached_agent_id: None,
             last_updated: now,
             started_at: now,
         }
@@ -288,6 +298,8 @@ mod tests {
             test_passed: false,
             rejection_notes: None,
             block_reason: None,
+            flag_count: 0,
+            rejection_count: 0,
         }
     }
 

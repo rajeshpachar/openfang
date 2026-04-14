@@ -16,12 +16,14 @@ mod backlog;
 mod classifier;
 mod commands;
 mod config;
+mod feedback;
 mod gate;
 mod git;
 mod guards;
 mod pipeline;
 mod prompt;
 mod runner;
+mod session;
 mod state;
 
 #[derive(Parser)]
