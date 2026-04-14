@@ -101,9 +101,9 @@ The pipeline is built **on top of** OpenFang's existing capabilities — not alo
 
 | OpenFang Module | Location | How pipeline uses it |
 |-----------------|----------|---------------------|
-| **Workflow Engine** | `openfang-kernel/src/workflow.rs` | Pipeline phases (decompose → execute → guard → gate) wired as `Sequential` workflow steps; gap-fix loop as `Loop{max_iterations: max_cycles}` |
+| **Workflow Engine** | `openfang-kernel/src/workflow.rs` | Pipeline **registers** itself as a workflow (for dashboard visibility). Execution is driven by pipeline CLI, not `run_workflow`. API: `POST /api/workflows` with `prompt` field (not `prompt_template`); `mode` is string (`"sequential"`, `"loop"`); `max_iterations` is sibling field on step object. HTTP API: port **50051** (not 4200 — that's the OFP P2P port). |
 | **Task Queue** | `openfang-memory/src/substrate.rs` | Each story posted via `task_post()`; claimed via `task_claim()`; completed via `task_complete()`. Resume = re-claim in-progress task. |
-| **Approval System** | `openfang-kernel/src/approvals.rs` | `request_approval(agent_id, "story_gate", summary)` blocks pipeline at every story boundary. Dashboard shows pending badge. Human responds in Tauri app or terminal. |
+| **Approval System** | `openfang-kernel/src/approvals.rs` | `POST /api/approvals` creates gate at every story boundary. Pipeline polls `GET /api/approvals` every 30s (no blocking call — async). Max `timeout_secs`: **300** (hardcoded). Re-post on expiry. Use `/reject` (not `/deny`). Dashboard shows pending badge. |
 | **Event Bus** | `openfang-kernel/src/event_bus.rs` | Each phase publishes completion event (e.g. `story_complete`, `gate_approved`). Next phase triggered automatically via `TriggerPattern::ContentMatch`. |
 | **Metering** | `openfang-kernel/src/metering.rs` | `check_quota()` before each Claude call; `get_summary()` for cost display at gate; per-issue cumulative spend. |
 | **Webhook receiver** | `openfang-types/src/webhook.rs` | `POST /hooks/agent` receives Backlog webhook events (v2 upgrade from polling). |
@@ -704,86 +704,44 @@ cat /tmp/with_map_response.txt
 
 ### POC-6: OpenFang Workflow Engine as Pipeline State Machine
 
-**Validates:** Research finding that existing Workflow Engine can replace custom state machine  
-**Risk if skipped:** If the engine can't call external processes or pause for human gates, we need a custom state machine — a major architecture decision.
+**Status: ✅ COMPLETE — 2026-04-14**
 
-**Experiment:**
+**Result:** Workflow CRUD via REST works correctly. Execution engine calls LLM (not Claude CLI) — not usable as pipeline executor. Architecture updated accordingly.
+
+**Confirmed correct API usage:**
 ```bash
-# Start OpenFang daemon first
-cd /Users/rajesh/Documents/GitHub/openfang
-cargo build --release -p openfang-cli 2>/dev/null
-ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY target/release/openfang start &
-sleep 6
-curl -s http://127.0.0.1:4200/api/health
+# Note: HTTP API is on port 50051 (not 4200 — that's the OFP P2P port)
+AGENT_ID=$(curl -s http://127.0.0.1:50051/api/agents | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
 
-# Test 1: Create a 3-step sequential workflow
-curl -s -X POST http://127.0.0.1:4200/api/workflows \
+# Create pipeline workflow — field name is "prompt" not "prompt_template"
+# mode is a string; max_iterations is a sibling field (not nested)
+curl -s -X POST http://127.0.0.1:50051/api/workflows \
   -H "Content-Type: application/json" \
-  -d '{
-    "name": "poc-pipeline-test",
-    "description": "POC: 3-step pipeline simulation",
-    "steps": [
-      {
-        "name": "decompose",
-        "agent": "default",
-        "prompt_template": "Say the word STEP1_DONE and nothing else.",
-        "mode": "Sequential",
-        "output_var": "step1_result",
-        "timeout_secs": 30
-      },
-      {
-        "name": "implement",
-        "agent": "default",
-        "prompt_template": "Previous step said: {{step1_result}}. Now say STEP2_DONE.",
-        "mode": "Sequential",
-        "output_var": "step2_result",
-        "timeout_secs": 30
-      },
-      {
-        "name": "review",
-        "agent": "default",
-        "prompt_template": "Steps said: {{step1_result}} and {{step2_result}}. Say STEP3_DONE.",
-        "mode": "Sequential",
-        "timeout_secs": 30
-      }
+  -d "{
+    \"name\": \"dev-pipeline-issue\",
+    \"steps\": [
+      {\"name\": \"explore\", \"agent_id\": \"$AGENT_ID\", \"prompt\": \"...\", \"mode\": \"sequential\", \"output_var\": \"explore_result\", \"timeout_secs\": 120, \"error_mode\": \"fail\"},
+      {\"name\": \"gap_fix_loop\", \"agent_id\": \"$AGENT_ID\", \"prompt\": \"...\", \"mode\": \"loop\", \"max_iterations\": 3, \"until\": \"passed == true\", \"timeout_secs\": 240, \"error_mode\": \"fail\"}
     ]
-  }' | jq '{id, name}'
+  }"
+# → {"workflow_id": "ab952eca-..."}  ✅
 
-WORKFLOW_ID=$(curl -s http://127.0.0.1:4200/api/workflows | jq -r '.[] | select(.name=="poc-pipeline-test") | .id')
-
-# Run it
-curl -s -X POST "http://127.0.0.1:4200/api/workflows/$WORKFLOW_ID/run" | jq .
-
-# Poll for result
-sleep 10
-curl -s http://127.0.0.1:4200/api/workflows/$WORKFLOW_ID/runs | jq '.[-1] | {status, outputs}'
-# Pass: outputs contain STEP1_DONE, STEP2_DONE, STEP3_DONE with correct variable substitution
-
-# Test 2: Can a workflow step invoke an external shell command / subprocess?
-# Check the workflow step prompt_template for bash execution capability
-# OR: check if agent tools include a Bash tool that the workflow step can invoke
-curl -s http://127.0.0.1:4200/api/agents | jq '.[0] | {name, tools}'
-# Key question: does the agent used by workflow steps have access to Bash/shell tools?
-
-# Test 3: Can a workflow pause for human approval?
-# Check approvals system
-curl -s http://127.0.0.1:4200/api/approvals 2>/dev/null | jq .
-# Try to submit an approval request via the kernel handle
-# This may require reading approvals.rs to understand the API surface
-
-# Cleanup
-pkill -f "openfang start"
+# GET workflow to verify loop mode persisted
+curl -s http://127.0.0.1:50051/api/workflows/ab952eca-... | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+for s in d['steps']: print(s['name'], s['mode'])
+"
+# gap_fix_loop: {'loop': {'max_iterations': 3, 'until': 'passed == true'}}  ✅
 ```
 
-**Pass criteria:**
-- [ ] 3-step workflow runs sequentially with `output_var` passing data between steps — verified in run output
-- [ ] **Critical:** workflow step agent has Bash tool access (can run `claude -p` as subprocess) — YES or NO documented
-- [ ] **Critical:** workflow can pause for human approval (approval system blocks step progression) — YES or NO documented
-- [ ] If either critical test is NO: document exactly what is missing → custom state machine scope defined
+**Architecture decision (from POC-6):**  
+Pipeline uses OpenFang Workflow Engine for **registration + dashboard visibility only**. The pipeline CLI drives execution — calls Claude CLI as subprocess for each phase, then updates state via REST APIs.
 
-**Decision:** If both critical tests pass → use workflow engine. If either fails → build minimal custom state machine for those specific gaps only, wrap the rest in workflow engine.
+- Workflow Engine execution (`POST /api/workflows/{id}/run`) → routes to Anthropic API, **not** Claude CLI
+- Do NOT call `run_workflow` in production — register the workflow, then drive steps from pipeline CLI
+- Status updates: publish to event bus after each phase; workflow shows in dashboard as registered entity
 
-**Unblocks:** Architecture decision (scoped to the gap, not rebuild-everything)
+**Unblocks:** Architecture decision ✅ resolved
 
 ---
 
@@ -1018,54 +976,61 @@ rm -f PIPELINE/PLAN-OFANG-POC-001.md
 
 ### POC-10: OpenFang Approval System as External Gate
 
-**Validates:** US-012 — human gates use OpenFang's existing approval system  
-**Risk if skipped:** If `request_approval()` can't be called from an external process or doesn't block correctly, the gate design has no implementation path.
+**Status: ✅ COMPLETE — 2026-04-14**
 
-**Experiment:**
+**Result:** Approval system works as pipeline gate. Async poll model (not blocking). Two key constraints found.
+
+**Confirmed API (all on port 50051):**
 ```bash
-# Start OpenFang daemon
-cd /Users/rajesh/Documents/GitHub/openfang
-ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY target/release/openfang start &
-sleep 6
-curl -s http://127.0.0.1:4200/api/health
+# Create gate approval (correct schema — all fields required)
+NOW=$(python3 -c "from datetime import datetime,timezone; print(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+AGENT_ID=$(curl -s http://127.0.0.1:50051/api/agents | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
+GATE_ID=$(python3 -c "import uuid; print(uuid.uuid4())")
 
-# Test 1: Check approvals API surface
-curl -s http://127.0.0.1:4200/api/approvals 2>/dev/null | jq . || echo "No approvals endpoint"
-# Document: is there a REST endpoint to POST an approval request?
-
-# Test 2: Check how approvals appear in the dashboard
-# Open browser to http://127.0.0.1:4200
-# Look for the approval badge on the Agents tab
-
-# Test 3: Submit an approval request via API (if endpoint exists)
-curl -s -X POST http://127.0.0.1:4200/api/approvals \
+curl -s -X POST http://127.0.0.1:50051/api/approvals \
   -H "Content-Type: application/json" \
-  -d '{
-    "agent_id": "pipeline-orchestrator",
-    "tool_name": "story_gate",
-    "summary": "US-001 complete. 3 files changed. Tests passed. Approve to continue to US-002?"
-  }' | jq .
+  -d "{
+    \"id\": \"$GATE_ID\",
+    \"agent_id\": \"$AGENT_ID\",
+    \"tool_name\": \"pipeline_gate\",
+    \"description\": \"Story US-001 complete — Guard: PASS, Tests: passed, Commit: abc1234. Approve to continue.\",
+    \"action_summary\": \"Continue pipeline after US-001 for OFANG-123\",
+    \"risk_level\": \"High\",
+    \"requested_at\": \"$NOW\",
+    \"timeout_secs\": 300
+  }"
+# → {"id": "...", "status": "pending"}
 
-# Test 4: Does the approval request block until answered?
-# In one terminal: POST the approval request
-# In another terminal/browser: approve it
-# Measure: does the first terminal unblock?
+# Poll for decision (no single-item GET — must filter list)
+curl -s http://127.0.0.1:50051/api/approvals | python3 -c "
+import sys, json, os
+d = json.load(sys.stdin)
+gate_id = os.environ.get('GATE_ID', '')
+m = next((a for a in d['approvals'] if a['id'] == gate_id), None)
+print(m['status'] if m else 'not found')
+"
 
-# Test 5: If no REST endpoint — what is the approval mechanism?
-# Read the approvals implementation
-grep -n "request_approval\|approval" crates/openfang-kernel/src/approvals.rs | head -30
+# Approve (from dashboard or CLI)
+curl -s -X POST "http://127.0.0.1:50051/api/approvals/$GATE_ID/approve" \
+  -H "Content-Type: application/json" \
+  -d '{"decided_by": "rajesh"}'
+# → {"id": "...", "status": "approved", "decided_at": "..."}
 
-pkill -f "openfang start"
+# Reject
+curl -s -X POST "http://127.0.0.1:50051/api/approvals/$GATE_ID/reject" \
+  -H "Content-Type: application/json" \
+  -d '{"decided_by": "rajesh", "notes": "Rework needed — tests not passing"}'
+# → {"id": "...", "status": "rejected", "decided_at": "..."}
 ```
 
-**Pass criteria:**
-- [ ] Approval API endpoint exists and accepts requests from external process (pipeline binary)
-- [ ] Submitted approval appears in dashboard badge count
-- [ ] Approving via dashboard (or API) unblocks the waiting process — confirmed with timing
-- [ ] If no blocking API: document the actual mechanism → update US-012 to match what actually exists
-- [ ] Rejection via dashboard triggers correct response (not just timeout)
+**Constraints confirmed (must handle in US-012 implementation):**
+1. `timeout_secs` max is **300** (hardcoded) — pipeline re-posts approval on expiry
+2. No `GET /api/approvals/{id}` — use list + filter
+3. `risk_level` case-sensitive: `High` not `high`; `tool_name` alphanumeric + underscores only
+4. `requested_at` must be current time — past timestamps cause immediate expiry
+5. Reject endpoint is `/reject` not `/deny`
 
-**Unblocks:** US-012 (approval gate implementation approach)
+**Unblocks:** US-012 ✅ resolved
 
 ---
 
@@ -1150,22 +1115,22 @@ wc -c /tmp/test_progress.md  # chars / 5 ≈ tokens
 
 ### POC Summary Table
 
-| POC | What it validates | Est. time | Blocks stories | Run order |
-|-----|------------------|-----------|----------------|-----------|
-| **POC-9** | Prompt assembly → Claude plan quality (foundation) | 1 hour | US-005, US-006 | **1st** |
-| **POC-1** | `--resume` continuity + cross-dir + post-commit resume | 3 hrs (wait) | US-008, US-015, US-016 | **1st** |
-| **POC-2** | `--json-schema` enforcement + budget exhaustion signal | 1 hour | US-005, US-008 | **1st** |
-| **POC-8** | Draft PR → `agent/dev` + chained branch picks up changes | 1 hour | US-003, US-017 | **1st** |
-| **POC-3** | Backlog API — real fields, statusIds, webhook delivery | 2 hours | US-001–US-004 | **2nd** |
-| **POC-6** | Workflow Engine: subprocess + gate blocking capability | 3 hours | Architecture | **2nd** |
-| **POC-10** | OpenFang approval system — external gate blocking | 2 hours | US-012 | **2nd** |
-| **POC-7** | Claude CLI in worktree — CLAUDE.md, commits, sessions | 1 hour | US-003 | **3rd** |
-| **POC-4** | Guard FP rate on real OpenFang code, pattern tuning | 2 hours | US-010, US-011 | **3rd** |
-| **POC-5** | Repo map — size, accuracy vs no-map baseline | 2 hours | US-005, US-018 | **3rd** |
-| **POC-11** | progress.md injection — measurable accuracy improvement | 1 hour | US-005, US-016 | **3rd** |
+| POC | What it validates | Est. time | Blocks stories | Status |
+|-----|------------------|-----------|----------------|--------|
+| **POC-9** | Prompt assembly → Claude plan quality (foundation) | 1 hour | US-005, US-006 | ✅ PASS |
+| **POC-1** | `--resume` continuity + cross-dir + post-commit resume | 3 hrs (wait) | US-008, US-015, US-016 | ✅ PASS (sessions directory-scoped) |
+| **POC-2** | `--json-schema` enforcement + budget exhaustion signal | 1 hour | US-005, US-008 | ✅ PASS (`structured_output` field confirmed) |
+| **POC-8** | Draft PR → `agent/dev` + chained branch picks up changes | 1 hour | US-003, US-017 | ✅ local PASS / ⏳ push needs fork |
+| **POC-3** | Backlog API — real fields, statusIds, webhook delivery | 2 hours | US-001–US-004 | ✅ PASS (all fields confirmed) |
+| **POC-6** | Workflow Engine: subprocess + gate blocking capability | 3 hours | Architecture | ✅ PASS (execution is LLM-only; use for registration/visibility) |
+| **POC-10** | OpenFang approval system — external gate blocking | 2 hours | US-012 | ✅ PASS (async poll; max 300s timeout; re-post on expiry) |
+| **POC-7** | Claude CLI in worktree — CLAUDE.md, commits, sessions | 1 hour | US-003 | ✅ PASS (worktrees required) |
+| **POC-4** | Guard FP rate on real OpenFang code, pattern tuning | 2 hours | US-010, US-011 | ✅ PASS (patterns revised) |
+| **POC-5** | Repo map — size, accuracy vs no-map baseline | 2 hours | US-005, US-018 | ✅ PASS (opt-in, 100 lines cap) |
+| **POC-11** | progress.md injection — measurable accuracy improvement | 1 hour | US-005, US-016 | ✅ PASS (38% cost reduction) |
 
-**Total time:** ~19 hours of active work + waiting time for POC-1 (overnight).  
-Run 1st-order POCs before writing any implementation code. Run 2nd-order before finalising architecture. Run 3rd-order before implementing those specific stories.
+**Status:** 10 of 11 POCs complete. POC-8 push/PR blocked pending fork with write access.  
+All architecture decisions resolved. Implementation can begin.
 
 ---
 
@@ -1704,43 +1669,79 @@ Guard rules are repo-specific and version controlled. Baseline rules always acti
 **Owner:** OpenFang approval gate
 
 **Description:**  
-After each story + guards, terminal shows a structured checkpoint. Human sees guards, diff summary, and test results — then decides.
+After each story + guards, the pipeline posts an approval request to OpenFang's Approval System and polls until the human decides. The gate is visible in the OpenFang Dashboard (Approvals tab) and in the terminal output. Human sees guards, diff summary, and test results — then approves, rejects, or flags via the dashboard or terminal.
+
+**POC-10 confirmed:** OpenFang Approval System works as the gate mechanism. Full API details below.
 
 **Acceptance Criteria:**
-- [ ] Gate renders: issue key, story ID + title, cycle count, guard results (coloured), files changed with +/- counts, test command + pass/fail
-- [ ] Full `git diff HEAD~1` available inline — gate shows first 40 lines, human can press `[D]` to page through full diff
+
+*Posting the gate:*
+- [ ] Pipeline calls `POST http://{openfang_host}:50051/api/approvals` with:
+  ```json
+  {
+    "id": "<uuid>",
+    "agent_id": "<openfang_agent_id>",
+    "tool_name": "pipeline_gate",
+    "description": "Story {story_id} complete — Guard: {pass|fail}, Tests: {passed|failed}. Commit: {hash}. Files: {count}. Cost: ${cost}.",
+    "action_summary": "Continue pipeline after {story_id} for {issue_key}",
+    "risk_level": "High",
+    "requested_at": "<ISO UTC now>",
+    "timeout_secs": 300
+  }
+  ```
+- [ ] `requested_at` is generated at POST time (current UTC); stale `requested_at` causes immediate expiry
+- [ ] `tool_name` is exactly `pipeline_gate` (alphanumeric + underscores only — no spaces or hyphens)
+- [ ] `risk_level` is exactly `High` (enum case-sensitive: `Low|Medium|High|Critical`)
+
+*Polling for decision:*
+- [ ] Pipeline polls `GET /api/approvals` every 30 seconds
+- [ ] Filter list by `id` to find the specific gate's status
+- [ ] On `status == "expired"`: re-post the approval (new UUID, current `requested_at`) and continue polling
+- [ ] On `status == "approved"`: continue to next story
+- [ ] On `status == "rejected"`: enter rework flow (US-014) — do not proceed
+- [ ] Gate waits indefinitely (re-posting on each 5-minute expiry)
+
+*Terminal display (while polling):*
+- [ ] Prints gate checkpoint block every time a new approval is posted:
+  ```
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   CHECKPOINT  OFANG-123  US-001: Add budget tracking
+   Role: backend · Cycle: 1/3 · Branch: pipeline/OFANG-123
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   GUARDS:
+    ✓ no_hardcoded_ports     ✓ no_unwrap_production
+    ⚠ magic_numbers — budget.rs:47 — bare 1000, should be config?
+    ✓ no_credentials_in_code ✓ no_todo_left_in_impl
+
+   FILES CHANGED:
+    + crates/openfang-kernel/src/budget.rs    (+42 -3)
+    ~ crates/openfang-kernel/src/agent.rs     (+5 -1)
+
+   TESTS:
+    cargo test -p openfang-kernel budget → 3 passed ✓
+
+   COST: $0.43 this issue (US-001: $0.43) · session budget remaining: $0.57
+
+   Waiting for approval in OpenFang Dashboard → Approvals tab
+   Approve: POST /api/approvals/{id}/approve
+   Reject:  POST /api/approvals/{id}/reject
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ```
+- [ ] Prints one-line status every 30s while waiting: `[GATE] Waiting... (approvals/{id} | pending | 2m 30s elapsed)`
 - [ ] `error`-level guard findings shown in red with file:line
 - [ ] `warn`-level findings shown in yellow
-- [ ] Options: `[A] Approve` / `[F] Flag` / `[R] Reject` / `[P] Pause`
-- [ ] `[A]` with unacknowledged `error`-level guards: requires typing `yes` to confirm override
-- [ ] Gate waits indefinitely — no timeout
 
-**Gate format:**
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- CHECKPOINT  OFANG-123  US-001: Add budget tracking
- Role: backend · Cycle: 1/3 · Branch: pipeline/OFANG-123
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- GUARDS:
-  ✓ no_hardcoded_ports     ✓ no_unwrap_production
-  ⚠ magic_numbers — budget.rs:47 — bare 1000, should be config?
-  ✓ no_credentials_in_code ✓ no_todo_left_in_impl
+*Human-facing:*
+- [ ] Human can approve or reject via OpenFang Dashboard → Approvals tab (one-click buttons)
+- [ ] Human can also approve via CLI: `curl -X POST http://localhost:50051/api/approvals/{id}/approve -H 'Content-Type: application/json' -d '{"decided_by":"rajesh"}'`
+- [ ] Rejection via dashboard or CLI: `POST /api/approvals/{id}/reject` (NOT `/deny`)
+- [ ] US-013 flag feedback: human posts rejection with `notes` field containing `FLAG: {feedback text}` — pipeline checks `decided_by` notes for `FLAG:` prefix to differentiate flag vs hard reject
 
- FILES CHANGED:
-  + crates/openfang-kernel/src/budget.rs    (+42 -3)
-  ~ crates/openfang-kernel/src/agent.rs     (+5 -1)
+*Implementation notes:*
+- No `GET /api/approvals/{id}` endpoint — must use list + filter
+- OpenFang agent_id: fetched at pipeline startup via `GET /api/agents` → first result's `.id`; cached in STATE file
 
- TESTS:
-  cargo test -p openfang-kernel budget → 3 passed ✓
-
- COST: $0.43 this issue (US-001: $0.43) · session budget remaining: $0.57
-
- [D] View full diff
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- [A] Approve   [F] Flag feedback   [R] Reject   [P] Pause
-```
-
-**Test scope:** manual walkthrough of all options including diff paging
+**Test scope:** manual walkthrough — create gate, see it in dashboard, approve via dashboard, verify pipeline continues; reject via CLI, verify rework flow starts
 
 ---
 

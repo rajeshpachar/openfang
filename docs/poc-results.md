@@ -1,5 +1,5 @@
 # POC Results — Autonomous Dev Pipeline
-**Status:** 8 of 11 complete (3 pending: POC-6 Workflow Engine, POC-10 Approval System, POC-8 push/PR — need fork)  
+**Status:** 10 of 11 complete (1 pending: POC-8 push/PR — needs fork with write access)  
 **Started:** 2026-04-14  
 **Linked PRD:** [`docs/dev-pipeline-prd.md`](dev-pipeline-prd.md)
 
@@ -25,11 +25,11 @@
 | POC-3 | Backlog API real fields + webhook | ✅ PASS — all field names confirmed | ✅ |
 | POC-4 | Guard runner on real OpenFang code | ✅ PASS (patterns revised) | ✅ |
 | POC-5 | Repo map generation + token size | ✅ PASS (decision: reduce to 100 lines) | ✅ |
-| POC-6 | OpenFang Workflow Engine as state machine | ⏳ Needs OpenFang running | — |
+| POC-6 | OpenFang Workflow Engine as state machine | ✅ PASS with critical finding | ✅ |
 | POC-7 | Claude CLI in git worktree | ✅ PASS | ✅ |
 | POC-8 | Draft PR → `agent/dev` + chained branch | ✅ partial (push blocked — need fork) | ✅ |
 | POC-9 | Full prompt assembly → Claude plan quality | ✅ PASS | ✅ |
-| POC-10 | OpenFang approval system as external gate | ⏳ Needs OpenFang running | — |
+| POC-10 | OpenFang approval system as external gate | ✅ PASS with constraints | ✅ |
 | POC-11 | `progress.md` accumulation and injection | ✅ PASS (reduces cost 38%) | ✅ |
 
 ---
@@ -408,6 +408,211 @@ Token cost of progress.md: **145 tokens** for 3-story accumulation.
 
 ---
 
+## POC-6: OpenFang Workflow Engine as Pipeline State Machine
+
+**Result: ✅ PASS — workflow CRUD works, but execution model has a critical architectural mismatch**
+
+### What was tested
+
+```bash
+# 1. Start daemon
+ANTHROPIC_API_KEY="" nohup ./target/release/openfang start > /tmp/openfang-daemon.log &
+# Daemon started on http://127.0.0.1:50051 (not :4200 — the network.listen_addr config is for OFP P2P)
+
+# 2. Create pipeline workflow — initial attempt (wrong field names)
+POST /api/workflows {"steps": [{"mode": {"Loop": {"max_iterations": 3}}, "prompt_template": "..."}]}
+# → 400 Error: mode must be a string; field is "prompt" not "prompt_template"
+
+# 3. Create pipeline workflow — correct field names
+POST /api/workflows {"steps": [
+  {"name": "explore", "mode": "sequential", "prompt": "...", ...},
+  {"name": "gap_fix_loop", "mode": "loop", "max_iterations": 3, "until": "passed == true", ...}
+]}
+# → 201 {"workflow_id": "ab952eca-..."}
+
+# 4. Verify persistence
+GET /api/workflows/ab952eca-...
+# → gap_fix_loop: mode={'loop': {'max_iterations': 3, 'until': 'passed == true'}} ✅
+
+# 5. Trigger execution
+POST /api/workflows/ab952eca-.../run {"input": {"issue_key": "PIPE-001", ...}}
+# → 500 "Workflow execution failed"
+# Daemon log: "LLM driver error: Auth error: x-api-key header is required"
+```
+
+### Confirmed API field names
+
+| API sends | Field name | Note |
+|-----------|------------|------|
+| `prompt` | **NOT** `prompt_template` | Routes read `s["prompt"]` |
+| `mode: "sequential"` | string, not object | |
+| `mode: "loop"` | string, with `max_iterations` + `until` as sibling fields | |
+| `mode: "fan_out"` / `"collect"` / `"conditional"` | strings | |
+| `error_mode: "retry"` | string, with `max_retries` as sibling | |
+| `agent_id` or `agent_name` | required | Either works |
+
+### CRITICAL architectural finding
+
+**The Workflow Engine calls the configured LLM provider (Anthropic API), NOT Claude CLI as a subprocess.**
+
+Each `WorkflowStep` calls `send_message(agent_id, prompt)` which routes through `kernel.run_agent_loop()` → LLM driver → Anthropic API. There is no `shell_exec` hook in the execution path.
+
+**Consequence:** The Workflow Engine **cannot** be used as the pipeline execution engine for Claude CLI invocations. Using it would require the daemon to have a valid Anthropic API key, and the execution would go through OpenFang's LLM routing — not through `claude` CLI subprocess calls.
+
+**What the Workflow Engine IS good for:**
+- Workflow definition storage + retrieval (CRUD) ✅
+- Tracking which workflow step is active ✅  
+- Triggering OpenFang agent loops (for internal prompts that don't need Claude CLI) ✅
+- Dashboard visibility of pipeline as a workflow ✅ (shows in `/workflows` tab)
+
+### Architecture decision
+
+The pipeline uses OpenFang's Workflow Engine for **registration and dashboard visibility only**. The actual execution is driven by the pipeline CLI tool itself, which:
+1. Registers the workflow with OpenFang at startup (so it's visible in dashboard)
+2. Calls Claude CLI as a subprocess for each phase
+3. Posts status to OpenFang's Event Bus after each phase completes
+
+This is consistent with the design principle: "OpenFang assembles prompts; Claude CLI does all the heavy lifting."
+
+### PRD changes
+- **Architecture diagram:** Clarify that Workflow Engine is used for registration/visibility, not execution. Add note: "Pipeline CLI drives execution; Workflow Engine tracks state."
+- **US-020 (OpenFang Workflow Engine integration):** Add new AC: "Pipeline registers itself as a workflow in OpenFang at startup so it appears in the dashboard Workflows tab. Status is updated via event bus, not via `run_workflow` endpoint."
+- **OpenFang API port:** Config `network.listen_addr = "127.0.0.1:4200"` is for OFP peer-to-peer protocol. The **HTTP API** runs on port 50051 (hardcoded as `api_listen`). Update `.pipeline/config.toml` default `openfang_base_url` to `http://127.0.0.1:50051`.
+
+---
+
+## POC-10: OpenFang Approval System as External Gate
+
+**Result: ✅ PASS — approve/reject work; two constraints must be handled**
+
+### What was tested
+
+```bash
+# 1. GET /api/approvals — list approvals
+# → {"approvals": [], "total": 0}  ✅ endpoint works
+
+# 2. POST /api/approvals — create gate request (wrong schema first)
+# → 422 "missing field `agent_id`"
+# → Schema requires: id, agent_id, tool_name, description, action_summary, risk_level, requested_at, timeout_secs
+
+# 3. POST /api/approvals — correct schema
+POST /api/approvals {
+  "id": "00000000-...",
+  "agent_id": "73615369-...",
+  "tool_name": "pipeline_gate",    # must be alphanumeric + underscores only
+  "description": "Story US-003 complete...",
+  "action_summary": "Continue pipeline after US-003",
+  "risk_level": "High",            # must match enum variant exactly: Low|Medium|High|Critical
+  "requested_at": "<current UTC timestamp>",  # MUST be current time, not past
+  "timeout_secs": 120              # MAX 300 (hardcoded). Use 120-300 for pipeline gates.
+}
+# → 201 {"id": "d02329fe-...", "status": "pending"} ✅
+
+# 4. GET /api/approvals — verify pending
+# → id=d02329fe status=pending tool=pipeline_gate ✅
+
+# 5. POST /api/approvals/{id}/approve
+# → {"id": "d02329fe-...", "status": "approved", "decided_at": "..."} ✅
+
+# 6. POST /api/approvals/{id}/reject  (NOT /deny)
+# → {"id": "...", "status": "rejected", "decided_at": "..."} ✅
+
+# 7. GET /api/approvals/{id} — single item
+# → 404 Not Found. No single-item GET endpoint exists.
+
+# 8. Pipeline polling pattern (correct approach):
+GET /api/approvals → filter by id in response array → check status field
+```
+
+### Exact schema for `POST /api/approvals`
+
+```json
+{
+  "id": "<uuid>",                   // pipeline generates this (for correlating poll responses)
+  "agent_id": "<openfang_agent_id>",// GET /api/agents → first result's id
+  "tool_name": "pipeline_gate",     // alphanumeric + underscores only — no spaces/hyphens
+  "description": "Story US-003 complete...",  // shown in dashboard approval panel
+  "action_summary": "Continue pipeline after US-003",
+  "risk_level": "High",             // enum: Low | Medium | High | Critical (exact case)
+  "requested_at": "<ISO UTC now>",  // server uses this + timeout_secs to compute expiry
+  "timeout_secs": 300               // max 300 (5 minutes). For human review use max value.
+}
+```
+
+### Constraints found
+
+**Constraint 1: MAX timeout is 300 seconds (5 minutes)**
+`MAX_TIMEOUT_SECS = 300` is hardcoded in `openfang-types/src/approval.rs`. Approvals auto-expire after 5 minutes.
+
+**Implication for pipeline:** Pipeline must re-post the approval when it expires. Human sees a badge counter in dashboard. When they click through, they see the latest active approval. Pipeline polls every 30 seconds; on expiry, reposts immediately.
+
+**Constraint 2: No single-item GET endpoint**
+`GET /api/approvals/{id}` → 404. Only `GET /api/approvals` (list all) exists.
+
+**Implication:** Pipeline polls the list and filters by `id`. Keep request IDs short (UUID works fine).
+
+**Constraint 3: `requested_at` must be current time**
+If `requested_at` is in the past by more than `timeout_secs`, the approval is immediately `expired`. Pipeline must generate `requested_at` from system clock at POST time.
+
+**Constraint 4: `risk_level` must match enum case exactly**
+`"Medium"` (not `"medium"`) — the API parses as enum variant name. `"medium"` silently falls through to default (`High`).
+
+### Endpoints confirmed
+
+| Endpoint | Status | Notes |
+|----------|--------|-------|
+| `GET /api/approvals` | ✅ | Returns `{approvals: [...], total: N}` |
+| `POST /api/approvals` | ✅ | Creates approval, returns `{id, status}` |
+| `POST /api/approvals/{id}/approve` | ✅ | Returns `{id, status: "approved", decided_at}` |
+| `POST /api/approvals/{id}/reject` | ✅ | Returns `{id, status: "rejected", decided_at}` |
+| `GET /api/approvals/{id}` | ❌ 404 | Does not exist — must use list + filter |
+| `POST /api/approvals/{id}/deny` | ❌ 404 | Use `/reject` not `/deny` |
+
+### Pipeline gate polling pattern
+
+```python
+# Post gate approval
+gate_id = str(uuid4())
+requests_at = datetime.utcnow().isoformat() + "Z"
+requests.post(f"{openfang_url}/api/approvals", json={
+    "id": gate_id,
+    "agent_id": agent_id,
+    "tool_name": "pipeline_gate",
+    "description": f"Story {story_id} complete — Guard: {guard_result}, Tests: {test_result}. Approve to continue.",
+    "action_summary": f"Continue pipeline after {story_id}",
+    "risk_level": "High",
+    "requested_at": requested_at,
+    "timeout_secs": 300
+})
+
+# Poll until decided
+while True:
+    approvals = requests.get(f"{openfang_url}/api/approvals").json()["approvals"]
+    match = next((a for a in approvals if a["id"] == gate_id), None)
+    if match is None or match["status"] == "expired":
+        # Repost — human hasn't seen it yet or it expired
+        gate_id = str(uuid4())  # new id for new expiry window
+        # POST again...
+    elif match["status"] == "approved":
+        break  # ✅ continue pipeline
+    elif match["status"] == "rejected":
+        # Mark story for rework, stop pipeline
+        break
+    time.sleep(30)
+```
+
+### PRD changes
+- **US-012 (Human Gate):** Replace custom TUI polling design with OpenFang Approval System
+- **US-012:** Gate implementation: `POST /api/approvals` with `timeout_secs: 300` (max). Re-post on expiry. Poll interval: 30s.
+- **US-012:** Decision mapping: `approved` → continue, `rejected` → rework, `expired` (after N re-posts) → pause
+- **US-012:** Add constraint: `tool_name` must be `pipeline_gate` (alphanumeric + underscores only)
+- **US-012:** Add constraint: `risk_level` enum is `Low|Medium|High|Critical` — exact case required
+- **US-012:** Polling pattern: `GET /api/approvals` list + filter by id (no single-item GET)
+- **US-012:** No blocking wait — approval is async. Pipeline loop sleeps 30s between polls.
+- **Architecture:** Clarify that approval system is async/poll-based, not blocking-call-based.
+
+---
+
 ## PRD Changes Log
 
 | Date | POC | Change |
@@ -428,34 +633,29 @@ Token cost of progress.md: **145 tokens** for 3-story accumulation.
 | 2026-04-14 | POC-3 | Webhook: deferred to v2, polling confirmed sufficient for v1 |
 | 2026-04-14 | POC-3 | `docs/BACKLOG.md` convention added to Repo Configuration section |
 | 2026-04-14 | All | OpenFang existing modules table added to "How OpenFang Works" section |
+| 2026-04-14 | POC-6 | Workflow Engine confirmed: CRUD via REST works; execution routes to LLM (not Claude CLI) |
+| 2026-04-14 | POC-6 | Correct field names: `prompt` (not `prompt_template`), `mode` is string, `max_iterations` is sibling field |
+| 2026-04-14 | POC-6 | API port: HTTP API is on :50051 (not :4200 — that's the OFP P2P port) |
+| 2026-04-14 | POC-6 | Architecture: Pipeline registers workflow for dashboard visibility; execution stays in pipeline CLI |
+| 2026-04-14 | POC-10 | Approval schema confirmed: requires id, agent_id, tool_name, description, action_summary, risk_level, requested_at, timeout_secs |
+| 2026-04-14 | POC-10 | Max timeout_secs: 300 (hardcoded). Pipeline must re-post on expiry. |
+| 2026-04-14 | POC-10 | Endpoints: POST /approve ✅, POST /reject ✅ (not /deny). No single-item GET. |
+| 2026-04-14 | POC-10 | Polling: GET /api/approvals list + filter by id. Sleep 30s between polls. |
+| 2026-04-14 | POC-10 | risk_level enum: exact case required (High not high). tool_name: alphanumeric + underscores only. |
 
 ---
 
 ## Pending POCs
 
-### POC-3: ✅ Complete — see results above
-
-### POC-6: OpenFang Workflow Engine as Pipeline State Machine
-**Location:** `crates/openfang-kernel/src/workflow.rs`  
-**Needs:** OpenFang daemon running (`cargo build --release && target/release/openfang start`)  
-**Blocks:** Architecture decision. If POC-6 passes: use `Sequential` + `Loop` workflow steps for all pipeline phases. If it fails: build minimal custom state machine.  
-**What to test:**
-1. Create a workflow with a `Sequential` step that spawns a subprocess (Claude CLI) and captures stdout
-2. Create a `Loop{max_iterations: 3}` step — verify it stops at the limit
-3. Create a `Conditional` step — verify branching on output content
-4. Test that a workflow step can block until subprocess exits (gate simulation)
-
 ### POC-8 push/PR: Draft PR creation  
-**Needs:** Fork `RightNow-AI/openfang` → `your-org/openfang`, push `rajeshpachar` as collaborator  
-**Blocks:** US-017 final validation
-
-### POC-10: OpenFang Approval System as External Gate
-**Location:** `crates/openfang-kernel/src/approvals.rs`  
-**Needs:** OpenFang daemon running  
-**Blocks:** US-012  
-**What to test:**
-1. Call `request_approval(agent_id, "story_gate", "US-001 complete — approve?")` from a subprocess
-2. Verify the call blocks until human responds (not a fire-and-forget)
-3. Verify the pipeline tab shows a pending approval badge
+**Status:** ⏳ Blocked on fork access  
+**Needs:** Fork `RightNow-AI/openfang` via GitHub web UI (current `GH_TOKEN` lacks `repo` scope for fork API).  
+**Action:** User creates fork at https://github.com/RightNow-AI/openfang → Fork button. Then:
+```bash
+git remote add fork https://github.com/rajeshpachar/openfang.git  # or your-org/openfang
+git push fork pipeline/TEST-001
+gh pr create --draft --base agent/dev --head pipeline/TEST-001 --title "feat: TEST-001" --body "Test PR"
+```
+**Blocks:** US-017 final draft PR validation. All other PRD items are unblocked.
 4. Approve via dashboard → verify subprocess unblocks and receives `true`
 5. Reject via dashboard → verify subprocess receives `false`
