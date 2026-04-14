@@ -12,10 +12,16 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;
 
+mod backlog;
+mod classifier;
 mod commands;
 mod config;
+mod gate;
 mod git;
+mod guards;
+mod pipeline;
 mod prompt;
+mod runner;
 mod state;
 
 #[derive(Parser)]
@@ -111,11 +117,19 @@ async fn run(command: PipelineCommand, repo_root: PathBuf) -> anyhow::Result<()>
         }
 
         PipelineCommand::Run { issue_key } => {
-            run_issue(&repo_root, &issue_key).await?;
+            let cfg = config::PipelineConfig::load(&repo_root)?;
+            // Doctor check first
+            let (backlog_base, backlog_api_key) = load_backlog_config(&repo_root);
+            let doctor = commands::doctor::run(&backlog_base, &backlog_api_key);
+            if !commands::doctor::print_and_check(&doctor) {
+                std::process::exit(1);
+            }
+            pipeline::run(&repo_root, &issue_key, &cfg).await?;
         }
 
         PipelineCommand::Resume { issue_key } => {
-            resume_issue(&repo_root, &issue_key).await?;
+            let cfg = config::PipelineConfig::load(&repo_root)?;
+            pipeline::resume(&repo_root, &issue_key, &cfg).await?;
         }
 
         PipelineCommand::Status => {
@@ -140,66 +154,6 @@ fn load_backlog_config(repo_root: &std::path::Path) -> (String, String) {
         .unwrap_or_default();
     let api_key = std::env::var("BACKLOG_API_KEY").unwrap_or_default();
     (backlog_base, api_key)
-}
-
-async fn run_issue(repo_root: &std::path::Path, issue_key: &str) -> anyhow::Result<()> {
-    println!("\n{} {}", "Pipeline →".bold(), issue_key.cyan().bold());
-    println!("{}", "─".repeat(50));
-
-    let cfg = config::PipelineConfig::load(repo_root)?;
-
-    // Startup checks
-    let backlog_api_key = std::env::var("BACKLOG_API_KEY").unwrap_or_default();
-    let doctor = commands::doctor::run(&cfg.backlog_base, &backlog_api_key);
-    if !commands::doctor::print_and_check(&doctor) {
-        std::process::exit(1);
-    }
-
-    // Branch + worktree setup (US-003)
-    println!("\n{}", "Branch Setup".bold());
-    let (branch, worktree_path) =
-        git::setup_issue_workspace(repo_root, issue_key, &cfg.base_branch)?;
-    println!("  Branch:   {}", branch.cyan());
-    println!("  Worktree: {}", worktree_path.display());
-
-    println!(
-        "\n  {} Issue {} ready — run `pipeline resume {}` to continue after interruption",
-        "✓".green(),
-        issue_key.cyan(),
-        issue_key
-    );
-    println!(
-        "\n  {} Full pipeline execution (decompose → implement → gate → PR) coming in Phase 2\n",
-        "ℹ".cyan()
-    );
-
-    Ok(())
-}
-
-async fn resume_issue(repo_root: &std::path::Path, issue_key: &str) -> anyhow::Result<()> {
-    if !state::PipelineState::exists(repo_root, issue_key) {
-        anyhow::bail!(
-            "No pipeline state found for {}. Run `pipeline run {}` first.",
-            issue_key,
-            issue_key
-        );
-    }
-
-    let state = state::PipelineState::load(repo_root, issue_key)?;
-    println!(
-        "\n{} {} (resuming from {:?})",
-        "Pipeline →".bold(),
-        issue_key.cyan().bold(),
-        state.phase
-    );
-
-    // TODO: Phase 2 — wire into full execution loop
-    println!(
-        "  {} Resume logic (full execution loop) coming in Phase 2\n",
-        "ℹ".cyan()
-    );
-
-    Ok(())
 }
 
 fn show_status(repo_root: &std::path::Path) -> anyhow::Result<()> {

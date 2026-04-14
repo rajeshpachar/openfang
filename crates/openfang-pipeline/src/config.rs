@@ -1,9 +1,38 @@
-// Phase 1 skeleton: many items are defined for Phase 2 use.
-#![allow(dead_code)]
-
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// Role label lists used by the classifier to determine backend vs frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleLabels {
+    #[serde(default = "default_backend_labels")]
+    pub backend: Vec<String>,
+    #[serde(default = "default_frontend_labels")]
+    pub frontend: Vec<String>,
+}
+
+impl Default for RoleLabels {
+    fn default() -> Self {
+        Self {
+            backend: default_backend_labels(),
+            frontend: default_frontend_labels(),
+        }
+    }
+}
+
+fn default_backend_labels() -> Vec<String> {
+    ["backend", "api", "kernel", "rust", "database", "performance"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn default_frontend_labels() -> Vec<String> {
+    ["frontend", "ui", "dashboard", "ux", "html", "css"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
 
 /// Pipeline configuration -- loaded from `.pipeline/config.toml` in the repo root.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +67,10 @@ pub struct PipelineConfig {
 
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
+
+    /// Role label classification rules.
+    #[serde(default)]
+    pub roles: RoleLabels,
 }
 
 fn default_base_branch() -> String { "dev".to_string() }
@@ -61,6 +94,7 @@ impl Default for PipelineConfig {
             repo_map_lines: 0,
             openfang_url: default_openfang_url(),
             poll_interval_secs: default_poll_interval_secs(),
+            roles: RoleLabels::default(),
         }
     }
 }
@@ -116,6 +150,11 @@ pub fn config_toml_template() -> String {
         "repo_map_lines = 0           # 0 = disabled. Set to 100 for large unfamiliar repos.\n",
         "openfang_url = \"http://127.0.0.1:50051\"  # OpenFang API for gates + dashboard\n",
         "poll_interval_secs = 300     # Backlog polling interval (seconds). Default: 5 min.\n",
+        "\n",
+        "[roles]\n",
+        "# Keyword → role mapping. Matched against issueType.name, category names, then summary.\n",
+        "backend  = [\"backend\", \"api\", \"kernel\", \"rust\", \"database\", \"performance\"]\n",
+        "frontend = [\"frontend\", \"ui\", \"dashboard\", \"ux\", \"html\", \"css\"]\n",
     ).to_string()
 }
 

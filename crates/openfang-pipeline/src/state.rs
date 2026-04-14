@@ -1,6 +1,4 @@
-// Phase 1 skeleton: PipelineState methods used in Phase 2.
 #![allow(dead_code)]
-
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -147,6 +145,85 @@ impl PipelineState {
     pub fn is_stale(&self) -> bool {
         let age = Utc::now() - self.last_updated;
         age.num_hours() > 24 && self.phase != Phase::Complete && self.phase != Phase::Abandoned
+    }
+
+    /// Add stories from decomposition output.
+    pub fn set_stories(&mut self, stories: Vec<StoryState>) {
+        self.stories = stories;
+        self.current_story_idx = 0;
+    }
+
+    /// Mark the current story done and advance to the next.
+    /// Returns true if there are more stories remaining.
+    pub fn advance_story(&mut self) -> bool {
+        if let Some(s) = self.stories.get_mut(self.current_story_idx) {
+            s.status = StoryStatus::Done;
+        }
+        self.current_story_idx += 1;
+        self.current_story_idx < self.stories.len()
+    }
+
+    /// Mark the current story as blocked.
+    pub fn block_story(&mut self, reason: &str) {
+        if let Some(s) = self.stories.get_mut(self.current_story_idx) {
+            s.status = StoryStatus::Blocked;
+            // Store reason in session_id slot as a quick workaround (Phase 2 only)
+            self.session_id = Some(format!("BLOCKED: {}", reason));
+        }
+    }
+
+    /// Accumulate cost from a story execution.
+    pub fn add_cost(&mut self, usd: f64) {
+        self.total_cost_usd += usd;
+        if let Some(s) = self.stories.get_mut(self.current_story_idx) {
+            s.cost_usd += usd;
+        }
+    }
+
+    /// Record the commit hash for the current story.
+    pub fn set_commit(&mut self, hash: &str) {
+        if let Some(s) = self.stories.get_mut(self.current_story_idx) {
+            s.commit_hash = Some(hash.to_string());
+        }
+    }
+
+    /// Increment the cycle counter for the current story.
+    pub fn increment_cycle(&mut self) {
+        if let Some(s) = self.stories.get_mut(self.current_story_idx) {
+            s.cycle_count += 1;
+        }
+    }
+
+    /// Completed story IDs (for the Execute phase prompt).
+    pub fn completed_story_ids(&self) -> Vec<String> {
+        self.stories[..self.current_story_idx]
+            .iter()
+            .filter(|s| s.status == StoryStatus::Done)
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// Find all state files in `repo_root/PIPELINE/` that are stale.
+    pub fn find_stale(repo_root: &Path) -> Vec<Self> {
+        let pipeline_dir = repo_root.join("PIPELINE");
+        if !pipeline_dir.exists() {
+            return vec![];
+        }
+        std::fs::read_dir(&pipeline_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let s = n.to_string_lossy();
+                s.starts_with("STATE-") && s.ends_with(".json")
+            })
+            .filter_map(|e| {
+                let raw = std::fs::read_to_string(e.path()).ok()?;
+                serde_json::from_str::<Self>(&raw).ok()
+            })
+            .filter(|s| s.is_stale())
+            .collect()
     }
 }
 
