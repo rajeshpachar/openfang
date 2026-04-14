@@ -545,6 +545,9 @@ async fn gate2(
         branch: &state.branch,
         cycle: story.cycle_count,
         max_cycles: cfg.max_cycles_per_story,
+        flag_count: story.flag_count,
+        rejection_count: story.rejection_count,
+        openfang_url: &cfg.openfang_url,
     };
 
     // Cache agent_id on first gate to avoid re-fetching every story
@@ -552,7 +555,11 @@ async fn gate2(
         GateClient::with_agent_id(&cfg.openfang_url, id)
     } else {
         match GateClient::new(&cfg.openfang_url).await {
-            Ok(g) => g,
+            Ok(g) => {
+                // Cache the agent_id so subsequent stories don't re-fetch it
+                state.cached_agent_id = Some(g.agent_id().to_string());
+                g
+            }
             Err(e) => {
                 eprintln!("  {} OpenFang unavailable ({}): using terminal gate", "WARN".yellow(), e);
                 return terminal_gate_fallback(state, repo_root, cfg, backlog, max_stories_per_session).await;
@@ -766,8 +773,11 @@ fn gapfix(
 
     let session_id = state.session_id.clone().unwrap_or_default();
 
-    let feedback_text = story.rejection_notes.clone()
-        .filter(|s| !s.is_empty())
+    // US-013/015: Reload flag feedback from disk — crash+resume resilience.
+    // On a fresh start after crash, rejection_notes in memory is empty but the
+    // feedback file was persisted by on_story_feedback() before the crash.
+    let feedback_text = feedback::load_flag_feedback(repo_root, &issue_ctx.key, &story.id)
+        .or_else(|| story.rejection_notes.clone().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "Address any test failures and code quality issues.".to_string());
 
     let story_ctx = StoryContext {
@@ -1196,5 +1206,149 @@ mod tests {
         assert!(guard_passed(story.guard_errors));
         assert_eq!(story.guard_warns, 2);
         assert!(story.test_passed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Flag path (US-013) — simulates on_story_feedback FLAG branch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_flag_increments_flag_count() {
+        let mut s = make_state(2);
+        // Simulate FLAG response
+        if let Some(story) = s.stories.get_mut(s.current_story_idx) {
+            story.flag_count += 1;
+            story.status = StoryStatus::Flagged;
+            story.rejection_notes = Some("FLAG: missing error handling".to_string());
+        }
+        s.phase = Phase::GapFix;
+
+        assert_eq!(s.stories[0].flag_count, 1);
+        assert_eq!(s.phase, Phase::GapFix);
+        assert_eq!(s.stories[0].status, StoryStatus::Flagged);
+    }
+
+    #[test]
+    fn test_three_flags_still_go_to_gapfix_not_abandon() {
+        let mut s = make_state(2);
+        // 3 flags — pipeline should warn but not abandon (still GapFix)
+        s.stories[0].flag_count = 3;
+        s.phase = Phase::GapFix;
+        // flag_count >= 3 is a warning, not a blocker
+        assert_eq!(s.phase, Phase::GapFix);
+        assert_ne!(s.phase, Phase::Abandoned);
+    }
+
+    #[test]
+    fn test_flag_feedback_stored_in_rejection_notes() {
+        let mut s = make_state(2);
+        let flag_text = "needs null check in handler".to_string();
+        if let Some(story) = s.stories.get_mut(s.current_story_idx) {
+            story.rejection_notes = Some(flag_text.clone());
+            story.flag_count += 1;
+            story.status = StoryStatus::Flagged;
+        }
+        s.phase = Phase::GapFix;
+
+        let story = s.current_story().unwrap();
+        assert_eq!(story.rejection_notes.as_deref(), Some("needs null check in handler"));
+        assert_eq!(story.flag_count, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reject path (US-014) — simulates on_story_feedback hard-reject branch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reject_increments_rejection_count() {
+        let mut s = make_state(2);
+        if let Some(story) = s.stories.get_mut(s.current_story_idx) {
+            story.rejection_count += 1;
+            story.status = StoryStatus::InProgress;
+            story.rejection_notes = Some("Tests still failing".to_string());
+        }
+        s.session_id = None; // fresh session on reject
+        s.phase = Phase::Execute;
+
+        assert_eq!(s.stories[0].rejection_count, 1);
+        assert!(s.session_id.is_none());
+        assert_eq!(s.phase, Phase::Execute);
+    }
+
+    #[test]
+    fn test_three_hard_rejects_escalate_to_abandoned() {
+        let mut s = make_state(2);
+        // Simulate escalation: 3rd rejection
+        s.stories[0].rejection_count = 3;
+        s.block_story("Hard-rejected 3 times without approval");
+        s.phase = Phase::Abandoned;
+
+        assert_eq!(s.phase, Phase::Abandoned);
+        assert_eq!(s.stories[0].status, StoryStatus::Blocked);
+        assert!(s.stories[0].block_reason.is_some());
+    }
+
+    #[test]
+    fn test_reject_clears_session_id_for_fresh_execute() {
+        let mut s = make_state(2);
+        s.session_id = Some("existing-session-abc".to_string());
+        // Simulate hard reject: session cleared so Execute runs fresh
+        s.session_id = None;
+        s.phase = Phase::Execute;
+
+        assert!(s.session_id.is_none());
+        assert_eq!(s.phase, Phase::Execute);
+    }
+
+    // -----------------------------------------------------------------------
+    // on_story_approved — Ralph loop integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_approved_advances_and_clears_session_at_ralph_threshold() {
+        let mut s = make_state(10);
+        s.session_id = Some("sess-abc".to_string());
+
+        let max = 5u32;
+
+        // Advance 5 stories (indices 0→4), landing at idx=5 which is a multiple of 5
+        for _ in 0..5 {
+            s.advance_story();
+        }
+
+        // Simulate Ralph loop check at idx=5
+        if is_ralph_threshold(s.current_story_idx, max) {
+            s.session_id = None;
+        }
+        let more = s.current_story_idx < s.stories.len();
+        s.phase = if more { Phase::Execute } else { Phase::Pr };
+
+        assert!(s.session_id.is_none(), "Ralph should have cleared session_id");
+        assert_eq!(s.phase, Phase::Execute);
+    }
+
+    #[test]
+    fn test_approved_last_story_transitions_to_pr() {
+        let mut s = make_state(1);
+        let more = s.advance_story();
+        s.phase = if more { Phase::Execute } else { Phase::Pr };
+        assert_eq!(s.phase, Phase::Pr);
+    }
+
+    // -----------------------------------------------------------------------
+    // State persistence — flag_count / rejection_count roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_flag_and_rejection_counts_persist_through_save_load() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = make_state(2);
+        s.stories[0].flag_count = 2;
+        s.stories[0].rejection_count = 1;
+        s.save(dir.path()).unwrap();
+
+        let loaded = PipelineState::load(dir.path(), "OFANG-001").unwrap();
+        assert_eq!(loaded.stories[0].flag_count, 2);
+        assert_eq!(loaded.stories[0].rejection_count, 1);
     }
 }

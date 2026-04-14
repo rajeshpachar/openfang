@@ -61,6 +61,12 @@ pub struct GateSummary<'a> {
     pub branch: &'a str,
     pub cycle: u32,
     pub max_cycles: u32,
+    /// Soft-flag count for this story (US-013).
+    pub flag_count: u32,
+    /// Hard-reject count for this story (US-014).
+    pub rejection_count: u32,
+    /// OpenFang URL for the approve/reject instructions shown to the reviewer.
+    pub openfang_url: &'a str,
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +89,11 @@ impl GateClient {
             agent_id,
             client,
         })
+    }
+
+    /// Return the agent ID this client was constructed with.
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
     }
 
     /// Create a client with a known agent_id (useful for testing / resuming).
@@ -235,15 +246,23 @@ async fn fetch_agent_id(client: &Client, openfang_url: &str) -> Result<String> {
 }
 
 fn build_description(s: &GateSummary<'_>) -> String {
-    let guard_status = if s.guard_pass {
+    let guard_status = if s.guard_pass && s.warn_count == 0 {
+        "Guards: PASS".to_string()
+    } else if s.guard_pass {
         format!("Guards: {} warns", s.warn_count)
     } else {
         format!("Guards: {} errors, {} warns", s.error_count, s.warn_count)
     };
     let test_status = if s.test_passed { "Tests: passed" } else { "Tests: FAILED" };
+    let history = if s.flag_count > 0 || s.rejection_count > 0 {
+        format!(" | Flags: {} Rejects: {}", s.flag_count, s.rejection_count)
+    } else {
+        String::new()
+    };
     format!(
-        "Story {} complete — {} | {} | Files: {} | Cost: ${:.2} | Cycle: {}/{}",
-        s.story_id, guard_status, test_status, s.files_changed, s.cost_this_issue, s.cycle, s.max_cycles
+        "Story {} complete — {} | {} | Files: {} | Cost: ${:.2} | Cycle: {}/{}{}",
+        s.story_id, guard_status, test_status, s.files_changed, s.cost_this_issue,
+        s.cycle, s.max_cycles, history
     )
 }
 
@@ -258,13 +277,15 @@ fn print_gate_block(s: &GateSummary<'_>) {
         s.story_title
     );
     println!(
-        " Role: backend · Cycle: {}/{} · Branch: {}",
-        s.cycle, s.max_cycles, s.branch.cyan()
+        " Cycle: {}/{} · Branch: {} · Commit: {}",
+        s.cycle, s.max_cycles, s.branch.cyan(), s.commit_hash.dimmed()
     );
     println!("{}", sep.bold());
 
-    let guard_line = if s.guard_pass {
-        format!(" {}  {} errors  {} warns", "GUARDS:".bold(), s.error_count, s.warn_count)
+    let guard_line = if s.guard_pass && s.warn_count == 0 {
+        format!(" {}  {}", "GUARDS:".bold(), "PASS".green())
+    } else if s.guard_pass {
+        format!(" {}  {} warns", "GUARDS:".bold(), s.warn_count)
     } else {
         format!(" {}  {} errors  {} warns", "GUARDS:".red().bold(), s.error_count, s.warn_count)
     };
@@ -278,13 +299,25 @@ fn print_gate_block(s: &GateSummary<'_>) {
     println!("{}", test_line);
 
     println!(
-        " {}  ${:.2} this issue",
+        " {}  ${:.2} this issue · {} files",
         "COST:".bold(),
-        s.cost_this_issue
+        s.cost_this_issue,
+        s.files_changed
     );
+
+    if s.flag_count > 0 || s.rejection_count > 0 {
+        println!(
+            " {}  flags={} hard-rejects={}",
+            "HISTORY:".bold(),
+            s.flag_count,
+            s.rejection_count
+        );
+    }
+
+    let base = s.openfang_url.trim_end_matches('/');
     println!();
-    println!(" Approve: POST http://localhost:50051/api/approvals/<id>/approve");
-    println!(" Reject:  POST http://localhost:50051/api/approvals/<id>/reject");
+    println!(" Approve: POST {}/api/approvals/<id>/approve", base);
+    println!(" Reject:  POST {}/api/approvals/<id>/reject  (prefix FLAG: for soft flag)", base);
     println!("{}\n", sep.bold());
 }
 
@@ -311,6 +344,9 @@ mod tests {
             branch: "pipeline/OFANG-101",
             cycle: 1,
             max_cycles: 3,
+            flag_count: 0,
+            rejection_count: 0,
+            openfang_url: "http://localhost:4200",
         }
     }
 
@@ -325,6 +361,14 @@ mod tests {
     }
 
     #[test]
+    fn test_build_description_pass_clean_guards() {
+        let mut s = sample_summary();
+        s.warn_count = 0;
+        let desc = build_description(&s);
+        assert!(desc.contains("Guards: PASS"));
+    }
+
+    #[test]
     fn test_build_description_fail() {
         let mut s = sample_summary();
         s.guard_pass = false;
@@ -333,5 +377,23 @@ mod tests {
         let desc = build_description(&s);
         assert!(desc.contains("2 errors"));
         assert!(desc.contains("Tests: FAILED"));
+    }
+
+    #[test]
+    fn test_build_description_includes_flag_history() {
+        let mut s = sample_summary();
+        s.flag_count = 2;
+        s.rejection_count = 1;
+        let desc = build_description(&s);
+        assert!(desc.contains("Flags: 2"));
+        assert!(desc.contains("Rejects: 1"));
+    }
+
+    #[test]
+    fn test_build_description_omits_history_when_clean() {
+        let s = sample_summary(); // flag_count=0, rejection_count=0
+        let desc = build_description(&s);
+        assert!(!desc.contains("Flags"));
+        assert!(!desc.contains("Rejects"));
     }
 }

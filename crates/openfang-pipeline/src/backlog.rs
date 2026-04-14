@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 ///
 /// Fetches open issues, updates status, and posts comments.
-/// All HTTP calls use exponential backoff (3 retries: 30s / 60s / 120s).
+/// HTTP calls are single-attempt; callers that use `let _ = backlog.add_comment(...)` tolerate failures gracefully.
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

@@ -320,8 +320,9 @@ fn generate_repo_map(repo_root: &Path, max_lines: u32) -> Result<String> {
 /// Update `PIPELINE/PROGRESS.md` by appending a new `progress_update` string.
 /// Called after each story completes.
 pub fn update_progress(repo_root: &Path, issue_key: &str, story_id: &str, update: &str) -> Result<()> {
-    let path = repo_root.join("PIPELINE").join("PROGRESS.md");
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let pipeline_dir = repo_root.join("PIPELINE");
+    let path = pipeline_dir.join("PROGRESS.md");
+    std::fs::create_dir_all(&pipeline_dir)?;
 
     let existing = if path.exists() {
         std::fs::read_to_string(&path).unwrap_or_default()
