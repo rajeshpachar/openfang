@@ -137,14 +137,17 @@ pub fn create_issue_branch(repo_root: &Path, issue_key: &str) -> Result<String> 
     let branch = format!("pipeline/{}", issue_key);
 
     if branch_exists(repo_root, &branch)? {
-        // Resume — just check it out
-        git(&["checkout", &branch], repo_root)?;
+        // Resume — branch is already checked out in its worktree.
+        // Do NOT try to check it out in the main repo: git refuses when a branch
+        // is already used by another worktree.
         println!(
             "  {} Resuming existing branch {}",
             "↩".yellow(),
             branch.cyan()
         );
     } else {
+        // New issue — create branch from agent/dev (checks it out in main repo).
+        // setup_issue_workspace will switch main back to base_branch immediately after.
         git(
             &["checkout", "-b", &branch, AGENT_DEV_BRANCH],
             repo_root,
