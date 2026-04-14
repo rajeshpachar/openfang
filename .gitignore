@@ -48,3 +48,5 @@ Thumbs.db
 
 # Personal deploy scripts
 scripts/deploy-remote.sh
+# Pipeline runtime state
+PIPELINE/

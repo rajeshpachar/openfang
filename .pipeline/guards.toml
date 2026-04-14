@@ -1,0 +1,75 @@
+# Guard rules -- run after every story commit, before human gate.
+# severity: "error" (blocks gate) | "warn" (shown but does not block)
+# enabled: true | false
+
+[[rule]]
+name = "no_hardcoded_ports"
+severity = "error"
+enabled = true
+description = "Hardcoded port numbers in string literals"
+pattern = 'port.*=.*"\d{4,5}"|\d{4,5}".*port|bind.*"\d{4,5}"'
+
+[[rule]]
+name = "no_hardcoded_ips"
+severity = "warn"
+enabled = true
+description = "Hardcoded IP addresses (excluding 0.0.0.0, 127.0.0.1, test/mock)"
+pattern = '"[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"'
+exclude_patterns = ["0\.0\.0\.0", "127\.0\.0\.1", "169\.254", "test", "mock", "block"]
+
+[[rule]]
+name = "no_unwrap_production"
+severity = "warn"
+enabled = true
+description = "Unwrap calls outside test code (warn -- FPs from in-file test modules)"
+pattern = '\.unwrap\(\)'
+exclude_patterns = ["mod tests", "assert", "let _ =", "_test.rs"]
+
+[[rule]]
+name = "no_todo_left_in_impl"
+severity = "error"
+enabled = true
+description = "TODO/FIXME/HACK markers left in implementation"
+pattern = 'TODO|FIXME|HACK'
+exclude_patterns = ["_test.rs", ".md"]
+
+[[rule]]
+name = "no_magic_numbers"
+severity = "warn"
+enabled = true
+description = "Magic number literals not assigned to a named constant"
+pattern = 'const [A-Z_]+ = [0-9]+'
+
+[[rule]]
+name = "no_credentials_in_code"
+severity = "error"
+enabled = true
+description = "Hardcoded credentials or secrets (excluding test fixtures)"
+pattern = 'password|api_key|secret.*=.*"'
+exclude_patterns = ["test-", "fake-", "mock-", "my-", "sample-", "example-"]
+
+[[rule]]
+name = "no_hardcoded_secrets"
+severity = "error"
+enabled = true
+description = "Bearer tokens or API key strings (20+ char alphanumeric)"
+pattern = '"[A-Za-z0-9_\-]{20,}"'
+exclude_patterns = ["test", "example", "placeholder", "YOUR_", "TODO"]
+
+[[rule]]
+name = "no_debug_print"
+severity = "warn"
+enabled = true
+description = "Debug print statements left in production code"
+pattern = 'println!|dbg!|eprintln!'
+exclude_patterns = ["_test.rs", "mod tests"]
+
+[[rule]]
+name = "business_logic_in_routes"
+severity = "warn"
+enabled = true
+description = "Handler functions with excessive lines (indicates logic leak into routes)"
+pattern = 'LINE_COUNT_CHECK'
+
+awk_check = true
+max_lines = 30
