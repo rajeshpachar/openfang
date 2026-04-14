@@ -1,5 +1,5 @@
 # POC Results — Autonomous Dev Pipeline
-**Status:** 10 of 11 complete (1 pending: POC-8 push/PR — needs fork with write access)  
+**Status:** 11 of 11 complete ✅ All POCs done.  
 **Started:** 2026-04-14  
 **Linked PRD:** [`docs/dev-pipeline-prd.md`](dev-pipeline-prd.md)
 
@@ -27,7 +27,7 @@
 | POC-5 | Repo map generation + token size | ✅ PASS (decision: reduce to 100 lines) | ✅ |
 | POC-6 | OpenFang Workflow Engine as state machine | ✅ PASS with critical finding | ✅ |
 | POC-7 | Claude CLI in git worktree | ✅ PASS | ✅ |
-| POC-8 | Draft PR → `agent/dev` + chained branch | ✅ partial (push blocked — need fork) | ✅ |
+| POC-8 | Draft PR → `agent/dev` + chained branch | ✅ PASS — rajeshpachar/openfang#1 | ✅ |
 | POC-9 | Full prompt assembly → Claude plan quality | ✅ PASS | ✅ |
 | POC-10 | OpenFang approval system as external gate | ✅ PASS with constraints | ✅ |
 | POC-11 | `progress.md` accumulation and injection | ✅ PASS (reduces cost 38%) | ✅ |
@@ -321,7 +321,7 @@ Since sessions are directory-scoped (POC-1), worktrees are now **required** for 
 
 ## POC-8: Git Branch Model — agent/dev + Draft PR
 
-**Result: ✅ PASS (local operations) — push/PR blocked until fork created**
+**Result: ✅ PASS — push and draft PR validated against rajeshpachar/openfang fork**
 
 ### What was tested (local)
 ```bash
@@ -339,12 +339,33 @@ git checkout -b pipeline/TEST-002     # ✅ starts with TEST-001's commit includ
 - ❌ Push to `RightNow-AI/openfang` denied — `rajeshpachar` has no write access
 - Draft PR (`gh pr create --draft`) not tested — needs push access
 
-### Blocker: Fork required
-The pipeline's push and PR work can only be tested after forking `RightNow-AI/openfang` → `your-org/openfang`. Until then, POC-8 push/PR validation is deferred.
+### Push + Draft PR (completed 2026-04-14)
+
+```bash
+# Fork created: rajeshpachar/openfang
+git remote add fork https://github.com/rajeshpachar/openfang.git
+
+# Push agent/dev integration branch
+git checkout -B agent/dev main
+git push fork agent/dev  # ✅
+
+# Push pipeline branch
+git checkout -b pipeline/POC-8-test
+git push fork pipeline/POC-8-test  # ✅
+
+# Create draft PR targeting agent/dev
+gh pr create --repo rajeshpachar/openfang --draft \
+  --base agent/dev --head pipeline/POC-8-test \
+  --title "feat(pipeline): POC-8 validation"
+# → https://github.com/rajeshpachar/openfang/pull/1  ✅
+
+# Convert to ready (when all stories approved)
+gh pr ready 1  # ✅ command confirmed
+```
 
 ### PRD changes
-- **POC-8 is ✅ on branch logic** — local git chain verified
-- **US-017 / POC-8 remaining:** Add to prerequisites: "Fork `RightNow-AI/openfang` before running POC-8 push/PR validation"
+- **POC-8 ✅ fully complete** — push + draft PR both confirmed working
+- **US-017:** `gh pr create --draft --base agent/dev --repo {fork}` confirmed exact command
 - **No other changes needed** — branch model is confirmed correct
 
 ---
@@ -647,15 +668,6 @@ while True:
 
 ## Pending POCs
 
-### POC-8 push/PR: Draft PR creation  
-**Status:** ⏳ Blocked on fork access  
-**Needs:** Fork `RightNow-AI/openfang` via GitHub web UI (current `GH_TOKEN` lacks `repo` scope for fork API).  
-**Action:** User creates fork at https://github.com/RightNow-AI/openfang → Fork button. Then:
-```bash
-git remote add fork https://github.com/rajeshpachar/openfang.git  # or your-org/openfang
-git push fork pipeline/TEST-001
-gh pr create --draft --base agent/dev --head pipeline/TEST-001 --title "feat: TEST-001" --body "Test PR"
-```
-**Blocks:** US-017 final draft PR validation. All other PRD items are unblocked.
+All 11 POCs complete. Implementation can begin (see `docs/dev-pipeline-prd.md` Phase 1).
 4. Approve via dashboard → verify subprocess unblocks and receives `true`
 5. Reject via dashboard → verify subprocess receives `false`

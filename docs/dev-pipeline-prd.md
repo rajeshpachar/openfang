@@ -1120,7 +1120,7 @@ wc -c /tmp/test_progress.md  # chars / 5 ≈ tokens
 | **POC-9** | Prompt assembly → Claude plan quality (foundation) | 1 hour | US-005, US-006 | ✅ PASS |
 | **POC-1** | `--resume` continuity + cross-dir + post-commit resume | 3 hrs (wait) | US-008, US-015, US-016 | ✅ PASS (sessions directory-scoped) |
 | **POC-2** | `--json-schema` enforcement + budget exhaustion signal | 1 hour | US-005, US-008 | ✅ PASS (`structured_output` field confirmed) |
-| **POC-8** | Draft PR → `agent/dev` + chained branch picks up changes | 1 hour | US-003, US-017 | ✅ local PASS / ⏳ push needs fork |
+| **POC-8** | Draft PR → `agent/dev` + chained branch picks up changes | 1 hour | US-003, US-017 | ✅ PASS — rajeshpachar/openfang#1 |
 | **POC-3** | Backlog API — real fields, statusIds, webhook delivery | 2 hours | US-001–US-004 | ✅ PASS (all fields confirmed) |
 | **POC-6** | Workflow Engine: subprocess + gate blocking capability | 3 hours | Architecture | ✅ PASS (execution is LLM-only; use for registration/visibility) |
 | **POC-10** | OpenFang approval system — external gate blocking | 2 hours | US-012 | ✅ PASS (async poll; max 300s timeout; re-post on expiry) |
@@ -1129,8 +1129,8 @@ wc -c /tmp/test_progress.md  # chars / 5 ≈ tokens
 | **POC-5** | Repo map — size, accuracy vs no-map baseline | 2 hours | US-005, US-018 | ✅ PASS (opt-in, 100 lines cap) |
 | **POC-11** | progress.md injection — measurable accuracy improvement | 1 hour | US-005, US-016 | ✅ PASS (38% cost reduction) |
 
-**Status:** 10 of 11 POCs complete. POC-8 push/PR blocked pending fork with write access.  
-All architecture decisions resolved. Implementation can begin.
+**Status:** 11 of 11 POCs complete ✅  
+All architecture decisions resolved. Implementation can begin (Phase 1 → US-000, US-018, US-003, US-005).
 
 ---
 
