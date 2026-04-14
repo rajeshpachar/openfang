@@ -1,0 +1,47 @@
+[package]
+name = "openfang-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Autonomous software development pipeline CLI"
+
+[[bin]]
+name = "pipeline"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# IDs
+uuid = { workspace = true }
+
+# HTTP client (for Backlog API + OpenFang API)
+reqwest = { workspace = true }
+
+# Coloured terminal output
+colored = { workspace = true }
+
+# Home directory
+dirs = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
