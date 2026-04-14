@@ -255,14 +255,22 @@ mod tests {
 
     #[test]
     fn test_is_auth_error_detects_keywords() {
+        // Checks that are still in is_auth_error (these are hard auth failures in stderr)
         assert!(is_auth_error("authentication required"));
         assert!(is_auth_error("not authenticated"));
-        assert!(is_auth_error("invalid api key provided"));
         assert!(is_auth_error("401 unauthorized"));
-        assert!(is_auth_error("your credit balance is exhausted"));
         assert!(is_auth_error("missing x-api-key header"));
         assert!(is_auth_error("please login to continue"));
         assert!(is_auth_error("sign in with your account"));
+        assert!(is_auth_error("no token found"));
+    }
+
+    #[test]
+    fn test_is_auth_error_does_not_flag_billing_errors() {
+        // "credit balance" and "api key" are billing/config issues, not auth failures.
+        // Max plan subscribers get these even when authenticated — must not block them.
+        assert!(!is_auth_error("your credit balance is exhausted"));
+        assert!(!is_auth_error("invalid api key provided"));
     }
 
     #[test]
