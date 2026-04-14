@@ -192,3 +192,101 @@ fn append_rule(out: &mut String, name: &str, severity: &str, description: &str, 
     }
     out.push('\n');
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_default_config_values() {
+        let cfg = PipelineConfig::default();
+        assert_eq!(cfg.base_branch, "dev");
+        assert_eq!(cfg.max_budget_usd, 3.00);
+        assert_eq!(cfg.max_stories_per_session, 5);
+        assert_eq!(cfg.max_iterations, 10);
+        assert_eq!(cfg.max_cycles_per_story, 3);
+        assert_eq!(cfg.repo_map_lines, 0);
+        assert_eq!(cfg.openfang_url, "http://127.0.0.1:50051");
+        assert_eq!(cfg.poll_interval_secs, 300);
+        assert!(cfg.backlog_base.is_empty());
+        assert!(cfg.backlog_project.is_empty());
+    }
+
+    #[test]
+    fn test_config_toml_template_is_valid_toml() {
+        let tmpl = config_toml_template();
+        // Must parse without error
+        let parsed: Result<toml::Value, _> = toml::from_str(&tmpl);
+        assert!(parsed.is_ok(), "config template is not valid TOML: {:?}", parsed.err());
+    }
+
+    #[test]
+    fn test_config_toml_template_contains_required_keys() {
+        let tmpl = config_toml_template();
+        assert!(tmpl.contains("base_branch"));
+        assert!(tmpl.contains("backlog_base"));
+        assert!(tmpl.contains("backlog_project"));
+        assert!(tmpl.contains("max_budget_usd"));
+        assert!(tmpl.contains("openfang_url"));
+        assert!(tmpl.contains("poll_interval_secs"));
+    }
+
+    #[test]
+    fn test_guards_toml_template_contains_all_rules() {
+        let tmpl = guards_toml_template();
+        assert!(tmpl.contains("no_hardcoded_ports"));
+        assert!(tmpl.contains("no_hardcoded_ips"));
+        assert!(tmpl.contains("no_unwrap_production"));
+        assert!(tmpl.contains("no_todo_left_in_impl"));
+        assert!(tmpl.contains("no_credentials_in_code"));
+        assert!(tmpl.contains("no_hardcoded_secrets"));
+        assert!(tmpl.contains("no_debug_print"));
+        assert!(tmpl.contains("business_logic_in_routes"));
+        assert!(tmpl.contains("[[rule]]"));
+    }
+
+    #[test]
+    fn test_guards_toml_template_has_valid_rule_structure() {
+        let tmpl = guards_toml_template();
+        // Every rule must have name, severity, enabled
+        for rule_block in tmpl.split("[[rule]]").skip(1) {
+            assert!(rule_block.contains("name ="), "rule block missing name");
+            assert!(rule_block.contains("severity ="), "rule block missing severity");
+            assert!(rule_block.contains("enabled ="), "rule block missing enabled");
+        }
+    }
+
+    #[test]
+    fn test_load_config_from_toml() {
+        let dir = TempDir::new().unwrap();
+        let pipeline_dir = dir.path().join(".pipeline");
+        std::fs::create_dir_all(&pipeline_dir).unwrap();
+        std::fs::write(
+            pipeline_dir.join("config.toml"),
+            "base_branch = \"main\"\nbacklog_base = \"https://test.backlog.com\"\nbacklog_project = \"TEST\"\n",
+        )
+        .unwrap();
+        let cfg = PipelineConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.base_branch, "main");
+        assert_eq!(cfg.backlog_base, "https://test.backlog.com");
+        assert_eq!(cfg.backlog_project, "TEST");
+        // Unset fields should use defaults
+        assert_eq!(cfg.max_budget_usd, 3.00);
+    }
+
+    #[test]
+    fn test_load_config_fails_without_file() {
+        let dir = TempDir::new().unwrap();
+        assert!(PipelineConfig::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn test_config_file_paths() {
+        let dir = TempDir::new().unwrap();
+        let cfg = PipelineConfig::default();
+        assert_eq!(cfg.backend_file(dir.path()), dir.path().join(".pipeline").join("backend.md"));
+        assert_eq!(cfg.frontend_file(dir.path()), dir.path().join(".pipeline").join("frontend.md"));
+        assert_eq!(cfg.guards_file(dir.path()), dir.path().join(".pipeline").join("guards.toml"));
+    }
+}

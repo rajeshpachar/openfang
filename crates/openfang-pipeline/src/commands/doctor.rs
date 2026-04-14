@@ -228,3 +228,85 @@ pub fn run_and_exit_on_failure(backlog_base: &str, backlog_api_key: &str) -> Res
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_auth_error_detects_keywords() {
+        assert!(is_auth_error("authentication required"));
+        assert!(is_auth_error("not authenticated"));
+        assert!(is_auth_error("invalid api key provided"));
+        assert!(is_auth_error("401 unauthorized"));
+        assert!(is_auth_error("your credit balance is exhausted"));
+        assert!(is_auth_error("missing x-api-key header"));
+        assert!(is_auth_error("please login to continue"));
+        assert!(is_auth_error("sign in with your account"));
+    }
+
+    #[test]
+    fn test_is_auth_error_passes_normal_output() {
+        assert!(!is_auth_error("ready"));
+        assert!(!is_auth_error("hello world"));
+        assert!(!is_auth_error("generating response..."));
+        assert!(!is_auth_error(""));
+        assert!(!is_auth_error("claude version 1.0.0"));
+    }
+
+    #[test]
+    fn test_doctor_result_all_ok_when_all_pass() {
+        let r = DoctorResult {
+            claude_ok: true,
+            claude_mode: "setup-token".into(),
+            claude_error: None,
+            backlog_ok: true,
+            backlog_error: None,
+            gh_ok: true,
+            gh_error: None,
+        };
+        assert!(r.all_ok());
+    }
+
+    #[test]
+    fn test_doctor_result_not_ok_if_claude_fails() {
+        let r = DoctorResult {
+            claude_ok: false,
+            claude_mode: String::new(),
+            claude_error: Some("not authenticated".into()),
+            backlog_ok: true,
+            backlog_error: None,
+            gh_ok: true,
+            gh_error: None,
+        };
+        assert!(!r.all_ok());
+    }
+
+    #[test]
+    fn test_doctor_result_not_ok_if_backlog_fails() {
+        let r = DoctorResult {
+            claude_ok: true,
+            claude_mode: "setup-token".into(),
+            claude_error: None,
+            backlog_ok: false,
+            backlog_error: Some("not configured".into()),
+            gh_ok: true,
+            gh_error: None,
+        };
+        assert!(!r.all_ok());
+    }
+
+    #[test]
+    fn test_doctor_result_not_ok_if_gh_fails() {
+        let r = DoctorResult {
+            claude_ok: true,
+            claude_mode: "setup-token".into(),
+            claude_error: None,
+            backlog_ok: true,
+            backlog_error: None,
+            gh_ok: false,
+            gh_error: Some("not authenticated".into()),
+        };
+        assert!(!r.all_ok());
+    }
+}

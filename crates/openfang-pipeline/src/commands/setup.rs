@@ -217,12 +217,16 @@ fn run_claude_setup(prompt: &str, cwd: &Path) -> Result<String> {
 }
 
 fn get_repo_structure(repo_root: &Path) -> String {
+    // Group the name checks with ( ... ) so -maxdepth 3 and -type f apply to all of them.
+    // Without grouping, `find`'s OR operator causes -maxdepth to bind only to the first clause.
     let out = Command::new("find")
-        .args([".", "-maxdepth", "3", "-type", "f",
-               "-name", "*.rs",
-               "-o", "-type", "f", "-name", "*.ts",
-               "-o", "-type", "f", "-name", "*.tsx",
-               "-o", "-type", "f", "-name", "Cargo.toml"])
+        .args([
+            ".", "-maxdepth", "3", "-type", "f",
+            "(", "-name", "*.rs",
+            "-o", "-name", "*.ts",
+            "-o", "-name", "*.tsx",
+            "-o", "-name", "Cargo.toml", ")",
+        ])
         .current_dir(repo_root)
         .output();
 
@@ -242,7 +246,8 @@ fn ensure_gitignore(repo_root: &Path) -> Result<()> {
 
     if gitignore.exists() {
         let content = std::fs::read_to_string(&gitignore).unwrap_or_default();
-        if content.contains(entry) {
+        // Match exact lines only — content.contains() would match entries inside comments.
+        if content.lines().any(|l| l.trim() == entry) {
             return Ok(());
         }
         let updated = format!("{}\n# Pipeline runtime state\n{}\n", content.trim_end(), entry);
@@ -296,3 +301,97 @@ Before committing:\n\
 - TODO: list required checks\n\n\
 ## Common Pitfalls\n\
 - TODO: describe frontend-specific gotchas\n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_create_if_absent_creates_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.toml");
+        create_if_absent(&path, "content here", "test.toml", false).unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "content here");
+    }
+
+    #[test]
+    fn test_create_if_absent_skips_existing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.toml");
+        std::fs::write(&path, "original").unwrap();
+        create_if_absent(&path, "new content", "test.toml", false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+    }
+
+    #[test]
+    fn test_create_if_absent_overwrites_on_refresh() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.toml");
+        std::fs::write(&path, "original").unwrap();
+        create_if_absent(&path, "new content", "test.toml", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content");
+    }
+
+    #[test]
+    fn test_ensure_gitignore_creates_new_file() {
+        let dir = TempDir::new().unwrap();
+        ensure_gitignore(dir.path()).unwrap();
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.lines().any(|l| l.trim() == "PIPELINE/"));
+    }
+
+    #[test]
+    fn test_ensure_gitignore_does_not_duplicate() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "PIPELINE/\n").unwrap();
+        ensure_gitignore(dir.path()).unwrap();
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert_eq!(content.matches("PIPELINE/").count(), 1);
+    }
+
+    #[test]
+    fn test_ensure_gitignore_appends_to_existing() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "target/\n*.log\n").unwrap();
+        ensure_gitignore(dir.path()).unwrap();
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains("target/"));
+        assert!(content.lines().any(|l| l.trim() == "PIPELINE/"));
+    }
+
+    #[test]
+    fn test_ensure_gitignore_not_fooled_by_comment() {
+        // A comment containing "PIPELINE/" must not suppress the real entry.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".gitignore"),
+            "# see PIPELINE/ for runtime state\ntarget/\n",
+        )
+        .unwrap();
+        ensure_gitignore(dir.path()).unwrap();
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        // Should now contain the actual entry line
+        assert!(content.lines().any(|l| l.trim() == "PIPELINE/"));
+    }
+
+    #[test]
+    fn test_check_claude_md_fails_without_file() {
+        let dir = TempDir::new().unwrap();
+        assert!(check_claude_md(dir.path(), false).is_err());
+    }
+
+    #[test]
+    fn test_check_claude_md_force_skips_missing_file() {
+        let dir = TempDir::new().unwrap();
+        assert!(check_claude_md(dir.path(), true).is_ok());
+    }
+
+    #[test]
+    fn test_check_claude_md_succeeds_when_present() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Test Repo").unwrap();
+        assert!(check_claude_md(dir.path(), false).is_ok());
+    }
+}
