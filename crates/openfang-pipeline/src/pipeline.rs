@@ -466,7 +466,7 @@ async fn gate2(
         .clone();
 
     // Enforce cycle limit before going to the gate
-    if story.cycle_count >= cfg.max_cycles_per_story {
+    if cycle_limit_reached(story.cycle_count, cfg.max_cycles_per_story) {
         println!(
             "\n  {} {} reached cycle limit ({}/{}) — blocking for human intervention",
             "LIMIT".red().bold(), story.id, story.cycle_count, cfg.max_cycles_per_story
@@ -479,7 +479,7 @@ async fn gate2(
         // Fall through to terminal fallback below
     }
 
-    let guard_pass = story.guard_errors == 0;
+    let guard_pass = guard_passed(story.guard_errors);
     let summary = GateSummary {
         issue_key: &state.issue_key,
         story_id: &story.id,
@@ -511,7 +511,7 @@ async fn gate2(
             let more_stories = state.advance_story();
             if more_stories {
                 // Check Ralph loop threshold
-                if state.current_story_idx.is_multiple_of(cfg.max_stories_per_session as usize) {
+                if is_ralph_threshold(state.current_story_idx, cfg.max_stories_per_session) {
                     println!("  {} Ralph loop — starting fresh session after {} stories",
                         "↻".cyan(), cfg.max_stories_per_session);
                     state.session_id = None;
@@ -715,6 +715,30 @@ async fn pr_phase(
 }
 
 // ---------------------------------------------------------------------------
+// Pure helpers — extracted for testability
+// ---------------------------------------------------------------------------
+
+/// Returns true if the Claude session should be reset before the next story.
+/// Fires when `story_idx` is a non-zero multiple of `max_stories_per_session`.
+/// Returns false if `max_stories_per_session` is 0 (disabled).
+pub(crate) fn is_ralph_threshold(story_idx: usize, max_stories_per_session: u32) -> bool {
+    if max_stories_per_session == 0 || story_idx == 0 {
+        return false;
+    }
+    story_idx.is_multiple_of(max_stories_per_session as usize)
+}
+
+/// Returns true if the story has exhausted its cycle budget.
+pub(crate) fn cycle_limit_reached(cycle_count: u32, max_cycles: u32) -> bool {
+    max_cycles > 0 && cycle_count >= max_cycles
+}
+
+/// Returns true if the story passed all guards (no error-severity violations).
+pub(crate) fn guard_passed(guard_errors: u32) -> bool {
+    guard_errors == 0
+}
+
+// ---------------------------------------------------------------------------
 // Stale state recovery
 // ---------------------------------------------------------------------------
 
@@ -737,5 +761,227 @@ async fn warn_stale_states(repo_root: &Path, backlog: &BacklogClient, _cfg: &Pip
         );
         let _ = backlog.add_comment(&s.issue_key, &msg).await;
         let _ = backlog.update_status(&s.issue_key, STATUS_OPEN).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{Phase, Role, StoryState, StoryStatus};
+    use std::path::PathBuf;
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    fn make_state(n_stories: usize) -> PipelineState {
+        let mut s = PipelineState::new(
+            "OFANG-001",
+            "Test issue",
+            Role::Backend,
+            "pipeline/OFANG-001",
+            PathBuf::from("/tmp/wt"),
+        );
+        let stories: Vec<StoryState> = (1..=n_stories)
+            .map(|i| StoryState {
+                id: format!("US-{:03}", i),
+                title: format!("Story {}", i),
+                status: StoryStatus::Pending,
+                session_id: None,
+                commit_hash: None,
+                files_changed: vec![],
+                cost_usd: 0.0,
+                cycle_count: 0,
+                guard_errors: 0,
+                guard_warns: 0,
+                test_passed: false,
+                rejection_notes: None,
+                block_reason: None,
+            })
+            .collect();
+        s.set_stories(stories);
+        s
+    }
+
+    // -----------------------------------------------------------------------
+    // is_ralph_threshold
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ralph_fires_at_exact_multiple() {
+        assert!(is_ralph_threshold(5, 5));
+        assert!(is_ralph_threshold(10, 5));
+        assert!(is_ralph_threshold(3, 3));
+    }
+
+    #[test]
+    fn test_ralph_does_not_fire_at_non_multiple() {
+        assert!(!is_ralph_threshold(4, 5));
+        assert!(!is_ralph_threshold(6, 5));
+        assert!(!is_ralph_threshold(1, 5));
+    }
+
+    #[test]
+    fn test_ralph_does_not_fire_at_zero_idx() {
+        // idx=0 always returns false — prevents reset before any stories run
+        assert!(!is_ralph_threshold(0, 5));
+        assert!(!is_ralph_threshold(0, 1));
+    }
+
+    #[test]
+    fn test_ralph_disabled_when_max_is_zero() {
+        // max_stories_per_session = 0 means disabled
+        assert!(!is_ralph_threshold(5, 0));
+        assert!(!is_ralph_threshold(10, 0));
+    }
+
+    #[test]
+    fn test_ralph_fires_after_nth_story_in_state_simulation() {
+        // Simulate: 6-story run with max_stories_per_session = 5.
+        // Ralph should fire after story 5 (idx becomes 5).
+        let mut s = make_state(6);
+        s.session_id = Some("original-session".to_string());
+
+        let max = 5u32;
+        let mut ralph_fired = false;
+
+        for _ in 0..5 {
+            let more = s.advance_story();
+            if more && is_ralph_threshold(s.current_story_idx, max) {
+                s.session_id = None;
+                ralph_fired = true;
+            }
+        }
+
+        assert!(ralph_fired, "Ralph should have fired at story 5");
+        assert!(s.session_id.is_none(), "session_id must be cleared by Ralph loop");
+        assert_eq!(s.current_story_idx, 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // cycle_limit_reached
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cycle_limit_reached_at_max() {
+        assert!(cycle_limit_reached(3, 3));
+        assert!(cycle_limit_reached(4, 3)); // above max also blocked
+    }
+
+    #[test]
+    fn test_cycle_limit_not_reached_below_max() {
+        assert!(!cycle_limit_reached(2, 3));
+        assert!(!cycle_limit_reached(0, 3));
+    }
+
+    #[test]
+    fn test_cycle_limit_disabled_when_max_is_zero() {
+        assert!(!cycle_limit_reached(99, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // guard_passed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_guard_passed_with_zero_errors() {
+        assert!(guard_passed(0));
+    }
+
+    #[test]
+    fn test_guard_failed_with_errors() {
+        assert!(!guard_passed(1));
+        assert!(!guard_passed(5));
+    }
+
+    // -----------------------------------------------------------------------
+    // State machine — approve path simulation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_approve_advances_to_execute_when_more_stories() {
+        let mut s = make_state(3);
+        // Simulate gate2 approve: advance story, check phase
+        let more = s.advance_story();
+        s.phase = if more { Phase::Execute } else { Phase::Pr };
+        assert_eq!(s.phase, Phase::Execute);
+        assert_eq!(s.current_story_idx, 1);
+    }
+
+    #[test]
+    fn test_approve_advances_to_pr_when_last_story() {
+        let mut s = make_state(1);
+        let more = s.advance_story();
+        s.phase = if more { Phase::Execute } else { Phase::Pr };
+        assert_eq!(s.phase, Phase::Pr);
+    }
+
+    // -----------------------------------------------------------------------
+    // State machine — reject path simulation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reject_stores_notes_and_transitions_to_gapfix() {
+        let mut s = make_state(2);
+        let notes = Some("The handler is too long".to_string());
+        // Simulate gate2 reject
+        if let Some(story) = s.stories.get_mut(s.current_story_idx) {
+            story.status = StoryStatus::Flagged;
+            story.rejection_notes = notes.clone();
+        }
+        s.phase = Phase::GapFix;
+
+        assert_eq!(s.phase, Phase::GapFix);
+        assert_eq!(s.stories[0].status, StoryStatus::Flagged);
+        assert_eq!(s.stories[0].rejection_notes, notes);
+    }
+
+    #[test]
+    fn test_reject_notes_available_for_gapfix_prompt() {
+        let mut s = make_state(2);
+        s.stories[0].rejection_notes = Some("Missing error handling in POST /users".to_string());
+
+        // GapFix reads rejection_notes to build prompt feedback
+        let feedback = s.stories[s.current_story_idx]
+            .rejection_notes
+            .clone()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "Address issues.".to_string());
+
+        assert_eq!(feedback, "Missing error handling in POST /users");
+    }
+
+    // -----------------------------------------------------------------------
+    // Guard results propagation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_guard_errors_stored_in_story_state() {
+        let mut s = make_state(2);
+        // Simulate run_guards storing results
+        if let Some(story) = s.stories.get_mut(s.current_story_idx) {
+            story.guard_errors = 2;
+            story.guard_warns = 3;
+        }
+        let story = s.current_story().unwrap();
+        assert!(!guard_passed(story.guard_errors));
+        assert_eq!(story.guard_warns, 3);
+    }
+
+    #[test]
+    fn test_guard_pass_propagates_to_gate_summary_fields() {
+        let mut s = make_state(2);
+        s.stories[0].guard_errors = 0;
+        s.stories[0].guard_warns = 2;
+        s.stories[0].test_passed = true;
+
+        let story = s.current_story().unwrap();
+        assert!(guard_passed(story.guard_errors));
+        assert_eq!(story.guard_warns, 2);
+        assert!(story.test_passed);
     }
 }
